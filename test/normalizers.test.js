@@ -977,6 +977,49 @@ test('applyAnthropicNormalization synthesizes narrow follow-up after read result
   assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
 });
 
+test('applyAnthropicNormalization synthesizes narrow follow-up for key-source-files intent', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_key_source_followup',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Let me read all the key source files first.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: 'README.md' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_a', content: 'readme' }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Bash');
+  assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
+});
+
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_plain_read',
@@ -1027,6 +1070,83 @@ test('applyAnthropicNormalization parses plain Write filename lines into tool_us
   const toolBlock = payload.content.find((block) => block.type === 'tool_use');
   assert.equal(toolBlock.name, 'Write');
   assert.equal(toolBlock.input.file_path, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\CLAUDE.md');
+});
+
+test('applyOpenAiChatNormalization coerces generic write path and text fields', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_write_generic',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '```json\n{"name":"Write","arguments":{"path":"/tmp/CLAUDE.md","text":"hello"}}\n```'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'Write',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            file_path: { type: 'string' },
+            content: { type: 'string' }
+          },
+          required: ['file_path', 'content']
+        }
+      }
+    }]
+  });
+
+  const args = JSON.parse(payload.choices[0].message.tool_calls[0].function.arguments);
+  assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'Write');
+  assert.equal(args.file_path, '/tmp/CLAUDE.md');
+  assert.equal(args.content, 'hello');
+});
+
+test('applyOpenAiChatNormalization maps delete_file into bash rm command', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_delete_file',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '```json\n{"name":"delete_file","arguments":{"path":"C:\\\\Users\\\\ali64\\\\Documents\\\\demo.cmd"}}\n```'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'Bash',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            command: { type: 'string' },
+            description: { type: 'string' }
+          },
+          required: ['command', 'description']
+        }
+      }
+    }]
+  });
+
+  const toolCall = payload.choices[0].message.tool_calls[0];
+  const args = JSON.parse(toolCall.function.arguments);
+  assert.equal(toolCall.function.name, 'Bash');
+  assert.equal(args.command, "rm -f -- 'C:\\Users\\ali64\\Documents\\demo.cmd'");
+  assert.match(args.description, /Delete file/);
 });
 
 test('applyAnthropicNormalization keeps ordinary completion text after prior assistant tool use', () => {
