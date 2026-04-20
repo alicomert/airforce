@@ -1,0 +1,28 @@
+{
+  "model": "glm-5",
+  "max_tokens": 512,
+  "stream": true,
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Return the weather for a city.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "city"
+        ]
+      }
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Call the get_weather tool for Istanbul. Do not answer normally."
+    }
+  ]
+}

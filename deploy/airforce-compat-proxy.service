@@ -1,0 +1,16 @@
+[Unit]
+Description=Airforce Compatibility Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/airforce
+EnvironmentFile=/etc/airforce-compat-proxy.env
+ExecStart=/usr/bin/node /root/airforce/server.js
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

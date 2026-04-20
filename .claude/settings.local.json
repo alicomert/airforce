@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sudo systemctl *)",
+      "Bash(systemctl status *)",
+      "Bash(journalctl *)",
+      "Bash(npm test *)",
+      "Bash(curl *)",
+      "Bash(command -v nginx)",
+      "Bash(nginx -t)",
+      "Bash(command -v gh)",
+      "Bash(sudo apt *)",
+      "Bash(git init *)"
+    ]
+  }
+}

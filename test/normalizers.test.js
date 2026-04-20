@@ -1,0 +1,487 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+
+import {
+  applyAnthropicNormalization,
+  applyOpenAiChatNormalization,
+  extractPseudoToolCalls
+} from '../lib/normalizers.js';
+
+test('extractPseudoToolCalls parses think and tool tags', () => {
+  const sample = `<think>internal</think>
+I'll read files.
+<tool_call>ReadFile path="C:\\demo\\AGENTS.md"</arg_value></arg_value>
+<tool_call>ReadFile path="C:\\demo\\config.php"</arg_value>`;
+
+  const parsed = extractPseudoToolCalls(sample);
+  assert.equal(parsed.text, "I'll read files.");
+  assert.equal(parsed.toolCalls.length, 2);
+  assert.equal(parsed.toolCalls[0].name, 'ReadFile');
+  assert.equal(parsed.toolCalls[0].input.path, 'C:\\demo\\AGENTS.md');
+});
+
+test('extractPseudoToolCalls parses official <tool_use> tags', () => {
+  const sample = `<think>internal<[PLHD36_never_used_51bce0c785ca2f68081bfa7d91973934]>
+I'll read files.
+<tool_use>ReadFile path="C:\\demo\\AGENTS.md"</tool_use>
+<tool_use>ReadFile path="C:\\demo\\config.php"</tool_use>`;
+
+  const parsed = extractPseudoToolCalls(sample);
+  assert.equal(parsed.text, "I'll read files.");
+  assert.equal(parsed.toolCalls.length, 2);
+  assert.equal(parsed.toolCalls[0].name, 'ReadFile');
+  assert.equal(parsed.toolCalls[0].input.path, 'C:\demo\AGENTS.md');
+});
+
+test('applyAnthropicNormalization converts pseudo tool calls into tool_use blocks', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_1',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Starting.\n<tool_call>ReadFile path="/tmp/a.txt"'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(payload.content[0].type, 'text');
+  assert.equal(payload.content[1].type, 'tool_use');
+  assert.equal(payload.content[1].name, 'ReadFile');
+});
+
+test('applyOpenAiChatNormalization sets tool_calls on malformed chat completion responses', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_1',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '<tool_call>ReadFile path="/tmp/a.txt"'
+      }
+    }]
+  });
+
+  assert.equal(payload.choices[0].finish_reason, 'tool_calls');
+  assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'ReadFile');
+});
+
+test('applyOpenAiChatNormalization remaps opencode-style read aliases and args', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_2',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '<tool_call>ReadFileContents path="C:\\\\demo\\\\AGENTS.md"'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            filePath: { type: 'string' }
+          },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  const toolCall = payload.choices[0].message.tool_calls[0];
+  assert.equal(toolCall.function.name, 'read');
+  assert.equal(JSON.parse(toolCall.function.arguments).filePath, 'C:\\demo\\AGENTS.md');
+});
+
+test('applyOpenAiChatNormalization fills bash description and command', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_3',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '```json\n{"name":"bash","arguments":{"cmd":"git status"}}\n```'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'bash',
+        parameters: {
+          type: 'object',
+          properties: {
+            command: { type: 'string' },
+            description: { type: 'string' }
+          },
+          required: ['command', 'description']
+        }
+      }
+    }]
+  });
+
+  const args = JSON.parse(payload.choices[0].message.tool_calls[0].function.arguments);
+  assert.equal(args.command, 'git status');
+  assert.match(args.description, /Runs command:/);
+});
+
+test('extractPseudoToolCalls parses fenced json tool calls', () => {
+  const parsed = extractPseudoToolCalls('```json\n{"name":"get_weather","arguments":{"location":"Istanbul"}}\n```');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'get_weather');
+  assert.equal(parsed.toolCalls[0].input.location, 'Istanbul');
+});
+
+test('extractPseudoToolCalls parses xml-style tool name blocks', () => {
+  const parsed = extractPseudoToolCalls('<tool_call><tool_name>get_weather</tool_name><arguments>{"city":"Istanbul"}</arguments>');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'get_weather');
+  assert.equal(parsed.toolCalls[0].input.city, 'Istanbul');
+});
+
+test('extractPseudoToolCalls parses claude-style angle tool shorthand', () => {
+  const parsed = extractPseudoToolCalls('Bash>find');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'Bash');
+  assert.equal(parsed.toolCalls[0].input.value, 'find');
+});
+
+test('applyOpenAiChatNormalization remaps loose read line into filePath', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_4',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: 'Read C:\\\\Users\\\\ALICOMERT\\\\Documents\\\\PROJELER\\\\kariyer\\\\AGENTS.md'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            filePath: { type: 'string' }
+          },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  const args = JSON.parse(payload.choices[0].message.tool_calls[0].function.arguments);
+  assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'read');
+  assert.equal(args.filePath, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\AGENTS.md');
+  assert.deepEqual(Object.keys(args), ['filePath']);
+});
+
+test('applyAnthropicNormalization remaps inline bash shorthand into bash tool input', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>find' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command', 'description']
+      }
+    }]
+  });
+
+  assert.equal(payload.content[0].type, 'tool_use');
+  assert.equal(payload.content[0].name, 'bash');
+  assert.equal(payload.content[0].input.command, 'find');
+});
+
+test('applyAnthropicNormalization parses xml server_name tool use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_glob',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '<tool_use><server_name>glob</server_name><arguments>{"pattern":"README*"}</arguments>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'glob',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          pattern: { type: 'string' }
+        },
+        required: ['pattern']
+      }
+    }]
+  });
+
+  assert.equal(payload.content[0].name, 'glob');
+  assert.equal(payload.content[0].input.pattern, 'README*');
+});
+
+test('applyOpenAiChatNormalization fills task required fields', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_task',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '```json\n{"name":"task","arguments":{"task":"Inspect repository"}}\n```'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'task',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            description: { type: 'string' },
+            prompt: { type: 'string' },
+            subagent_type: { type: 'string' }
+          },
+          required: ['description', 'prompt', 'subagent_type']
+        }
+      }
+    }]
+  });
+
+  const args = JSON.parse(payload.choices[0].message.tool_calls[0].function.arguments);
+  assert.equal(args.description, 'Inspect repository');
+  assert.equal(args.prompt, 'Inspect repository');
+  assert.equal(args.subagent_type, 'general');
+});
+
+test('extractPseudoToolCalls parses arg_key and arg_value pairs', () => {
+  const parsed = extractPseudoToolCalls('<tool_call>Bash<arg_key>command</arg_key><arg_value>find . -maxdepth 1</arg_value>');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'Bash');
+  assert.equal(parsed.toolCalls[0].input.command, 'find . -maxdepth 1');
+});
+
+test('applyAnthropicNormalization remaps bash variant names to bash', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_variant',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '<tool_call>Bash.Find()<arg_key>command</arg_key><arg_value>find . -maxdepth 1</arg_value>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command', 'description']
+      }
+    }]
+  });
+
+  assert.equal(payload.content[0].name, 'bash');
+  assert.equal(payload.content[0].input.command, 'find . -maxdepth 1');
+});
+
+test('applyAnthropicNormalization repairs structured empty bash tool_use with following command carrier', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_structured',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'toolu_a', name: 'Bash', input: {} },
+      { type: 'text', text: '<tool_call>command</arg_key><arg_value>{"value":"find . -maxdepth 1"}</arg_value>' }
+    ],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Bash');
+  assert.equal(toolBlock.input.command, 'find . -maxdepth 1');
+});
+
+test('applyAnthropicNormalization maps filesystem.read_file to Read-style input', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_fs_read',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'text', text: '<tool_use><server_name>filesystem</server_name><tool_name>read_file</tool_name><arguments>{"path":"README.md"}</arguments></tool_use>' }
+    ],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' }
+        },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'README.md');
+});
+
+test('applyAnthropicNormalization maps filesystem.list_directory to Glob-style pattern', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_fs_list',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'text', text: '<tool_use><server_name>filesystem</server_name><tool_name>list_directory</tool_name><arguments>{"path":"."}</arguments></tool_use>' }
+    ],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          pattern: { type: 'string' }
+        },
+        required: ['pattern']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Glob');
+  assert.equal(toolBlock.input.pattern, '*');
+});
+
+test('applyAnthropicNormalization maps query-string read shorthand to file_path', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_query_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Read ?file=c:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\README.md' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' }
+        },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'c:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\README.md');
+});
+
+test('applyAnthropicNormalization strips invalid unicode suffix from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bad_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>find . -maxdepth 1 | head -100帛' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'find . -maxdepth 1 | head -100');
+});
+
+test('applyAnthropicNormalization strips parameter closing tags from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_param_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>ls -la</parameter>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'ls -la');
+});
