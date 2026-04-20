@@ -824,6 +824,57 @@ test('applyAnthropicNormalization synthesizes follow-up tool calls after tool_re
   assert.equal(payload.content.some((block) => block.type === 'tool_use' && block.name === 'Bash'), true);
 });
 
+test('applyAnthropicNormalization synthesizes follow-up reads after tool_result when model returns short intent text', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_followup_intent',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Let me check the existing CLAUDE.md and AGENTS.md, plus key files to verify accuracy.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      {
+        name: 'Bash',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            command: { type: 'string' },
+            description: { type: 'string' }
+          },
+          required: ['command']
+        }
+      },
+      {
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            file_path: { type: 'string' }
+          },
+          required: ['file_path']
+        }
+      }
+    ],
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_prev', name: 'Bash', input: { command: 'find .' } }]
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_prev', content: 'ok' }]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.some((block) => block.name === 'Read' && block.input.file_path === 'CLAUDE.md'), true);
+  assert.equal(toolBlocks.some((block) => block.name === 'Read' && block.input.file_path === 'AGENTS.md'), true);
+});
+
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_plain_read',
