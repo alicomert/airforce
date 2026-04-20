@@ -30,7 +30,7 @@ I'll read files.
   assert.equal(parsed.text, "I'll read files.");
   assert.equal(parsed.toolCalls.length, 2);
   assert.equal(parsed.toolCalls[0].name, 'ReadFile');
-  assert.equal(parsed.toolCalls[0].input.path, 'C:\demo\AGENTS.md');
+  assert.equal(parsed.toolCalls[0].input.path, 'C:\\demo\\AGENTS.md');
 });
 
 test('applyAnthropicNormalization converts pseudo tool calls into tool_use blocks', () => {
@@ -354,6 +354,37 @@ test('applyAnthropicNormalization repairs structured empty bash tool_use with fo
   assert.equal(toolBlock.input.command, 'find . -maxdepth 1');
 });
 
+test('applyAnthropicNormalization keeps incomplete bash tool call long enough to coerce required fields', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_coerce',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'toolu_b', name: 'bash', input: {} },
+      { type: 'text', text: '<tool_call>command</arg_key><arg_value>git status</arg_value>' }
+    ],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command', 'description']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'bash');
+  assert.equal(toolBlock.input.command, 'git status');
+  assert.match(toolBlock.input.description, /Runs command:/);
+});
+
 test('applyAnthropicNormalization maps filesystem.read_file to Read-style input', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_fs_read',
@@ -484,4 +515,299 @@ test('applyAnthropicNormalization strips parameter closing tags from bash comman
 
   const toolBlock = payload.content.find((block) => block.type === 'tool_use');
   assert.equal(toolBlock.input.command, 'ls -la');
+});
+
+test('applyAnthropicNormalization strips trailing UI artifact suffix from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_nearly_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>find . -maxdepth 1 -type f | head -30Nearly>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'find . -maxdepth 1 -type f | head -30');
+});
+
+test('applyAnthropicNormalization converts fenced bash blocks into bash tool_use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_fenced_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '```bash\nls -la /root/airforce/\n```' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Bash');
+  assert.equal(toolBlock.input.command, 'ls -la /root/airforce/');
+});
+
+test('applyAnthropicNormalization remaps cat tool use into Read input', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_cat_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_cat', name: 'cat', input: { command: 'cat README.md' } }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' }
+        },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'README.md');
+});
+
+test('applyAnthropicNormalization remaps shell command tool names into Bash', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_ls_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_ls', name: 'ls', input: {} }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Bash');
+  assert.equal(toolBlock.input.command, 'ls');
+});
+
+test('applyAnthropicNormalization extracts fenced bash even when other tool uses exist', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_mixed_tools',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '```bash\nls -la /root/airforce/\n```\n<tool_use><server_name>glob</server_name><arguments>{"pattern":"*.md"}</arguments>'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      {
+        name: 'Bash',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            command: { type: 'string' }
+          },
+          required: ['command']
+        }
+      },
+      {
+        name: 'Glob',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            pattern: { type: 'string' }
+          },
+          required: ['pattern']
+        }
+      }
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: '<command-message>/init</command-message>'
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 2);
+  const bashBlock = toolBlocks.find((block) => block.name === 'Bash');
+  const globBlock = toolBlocks.find((block) => block.name === 'Glob');
+  assert.equal(bashBlock.input.command, 'ls -la /root/airforce/');
+  assert.equal(globBlock.input.pattern, '*.md');
+});
+
+test('applyAnthropicNormalization synthesizes initial exploration tools for text-only exploratory reply', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_explore_only',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: "I'll analyze the codebase to understand its architecture and create an improved CLAUDE.md." }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      {
+        name: 'Bash',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            command: { type: 'string' },
+            description: { type: 'string' }
+          },
+          required: ['command']
+        }
+      },
+      {
+        name: 'Glob',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            pattern: { type: 'string' }
+          },
+          required: ['pattern']
+        }
+      }
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: '<command-message>/init</command-message>'
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 2);
+  assert.equal(toolBlocks[0].name, 'Bash');
+  assert.match(toolBlocks[0].input.command, /find \. -maxdepth 1/);
+  assert.equal(toolBlocks[1].name, 'Glob');
+  assert.equal(toolBlocks[1].input.pattern, '*.md');
+});
+
+test('applyAnthropicNormalization does not synthesize exploration tools for ordinary short replies without action context', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_plain_short',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'I can help with that.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'hello there' }
+    ]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((block) => block.type === 'tool_use').length, 0);
+});
+
+test('applyAnthropicNormalization parses malformed xml parameters tool text into tool_use blocks', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_malformed_xml',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<tool_call>Skill tool_use>\n<tool_name>Read</tool_name>\n<parameters>\n<file_path>README.md</file_path>\n</parameters>\n<tool_name>Read</tool_name>\n<parameters>\n<file_path>AGENTS.md</file_path>\n</parameters>'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' }
+        },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 2);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'README.md');
+  assert.equal(toolBlocks[1].input.file_path, 'AGENTS.md');
+});
+
+test('applyAnthropicNormalization synthesizes follow-up tool calls after tool_result when model returns empty content', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_empty_after_tool',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_prev', content: 'ok' }]
+      }
+    ]
+  });
+
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(payload.content.some((block) => block.type === 'tool_use' && block.name === 'Bash'), true);
 });

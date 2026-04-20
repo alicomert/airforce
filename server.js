@@ -1,5 +1,7 @@
 import http from 'node:http';
 import process from 'node:process';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   maybeRewriteModel,
@@ -80,23 +82,21 @@ function readBody(req) {
   });
 }
 
-function buildUpstreamHeaders(req, bodyLength) {
+export function buildUpstreamHeaders(req, bodyLength) {
   const headers = new Headers();
 
   for (const [key, value] of Object.entries(req.headers)) {
     if (value == null) {
       continue;
     }
-    if (['host', 'content-length', 'connection'].includes(key.toLowerCase())) {
+    if (['host', 'content-length', 'connection', 'x-api-key', 'authorization'].includes(key.toLowerCase())) {
       continue;
     }
     headers.set(key, Array.isArray(value) ? value.join(', ') : value);
   }
 
-  if (!headers.has('authorization') && !headers.has('x-api-key') && DEFAULT_API_KEY) {
+  if (DEFAULT_API_KEY) {
     headers.set('authorization', `Bearer ${DEFAULT_API_KEY}`);
-  }
-  if (!headers.has('x-api-key') && !headers.has('authorization') && DEFAULT_API_KEY) {
     headers.set('x-api-key', DEFAULT_API_KEY);
   }
   if (bodyLength != null) {
@@ -106,9 +106,10 @@ function buildUpstreamHeaders(req, bodyLength) {
   return headers;
 }
 
-function shouldHandleSyntheticStream(pathname, requestBody) {
+export function shouldHandleSyntheticStream(pathname, requestBody) {
   return Boolean(requestBody?.stream) && (
     pathname.includes('/anthropic/') ||
+    pathname === '/v1/messages' ||
     pathname.endsWith('/chat/completions')
   );
 }
@@ -224,8 +225,25 @@ const server = http.createServer(async (req, res) => {
     }
 
     let payload = upstreamText ? JSON.parse(upstreamText) : {};
+    const rawPayload = payload;
     payload = normalizeJsonPayload(requestUrl.pathname, payload, parsedBody);
     payload = restorePresentedModel(parsedBody, payload);
+    if (
+      requestUrl.pathname.includes('/anthropic/') &&
+      Array.isArray(rawPayload?.content) &&
+      Array.isArray(payload?.content) &&
+      rawPayload.content.length > 0 &&
+      payload.content.length === 0
+    ) {
+      logDebug('normalization_emptied_content', {
+        path: requestUrl.pathname,
+        raw: rawPayload.content.map((block) => ({
+          type: block?.type,
+          name: block?.name,
+          text: typeof block?.text === 'string' ? block.text.slice(0, 200) : undefined
+        }))
+      });
+    }
     logDebug('response', requestUrl.pathname.includes('/anthropic/')
       ? {
           stop_reason: payload?.stop_reason,
@@ -254,7 +272,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (shouldStreamLocally) {
-      if (requestUrl.pathname.includes('/anthropic/')) {
+      if (requestUrl.pathname.includes('/anthropic/') || requestUrl.pathname === '/v1/messages') {
         const sse = anthropicSseFromMessage(payload);
         res.writeHead(upstreamResponse.status, {
           'content-type': 'text/event-stream; charset=utf-8',
@@ -290,7 +308,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, HOST, () => {
-  console.log(`Airforce compat proxy listening on http://${HOST}:${PORT}`);
-  console.log(`Upstream: ${UPSTREAM_BASE_URL}`);
-});
+const isMainModule = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isMainModule) {
+  server.listen(PORT, HOST, () => {
+    console.log(`Airforce compat proxy listening on http://${HOST}:${PORT}`);
+    console.log(`Upstream: ${UPSTREAM_BASE_URL}`);
+  });
+}
