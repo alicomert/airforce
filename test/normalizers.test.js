@@ -683,7 +683,7 @@ test('applyAnthropicNormalization extracts fenced bash even when other tool uses
   assert.equal(globBlock.input.pattern, '*.md');
 });
 
-test('applyAnthropicNormalization synthesizes initial exploration tools for text-only exploratory reply', () => {
+test('applyAnthropicNormalization keeps text-only exploratory reply as text when no explicit command exists', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_explore_only',
     type: 'message',
@@ -725,12 +725,8 @@ test('applyAnthropicNormalization synthesizes initial exploration tools for text
   });
 
   const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.length, 2);
-  assert.equal(toolBlocks[0].name, 'Bash');
-  assert.match(toolBlocks[0].input.command, /find \. -maxdepth 1/);
-  assert.equal(toolBlocks[1].name, 'Glob');
-  assert.equal(toolBlocks[1].input.pattern, '*.md');
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(toolBlocks.length, 0);
 });
 
 test('applyAnthropicNormalization does not synthesize exploration tools for ordinary short replies without action context', () => {
@@ -793,7 +789,7 @@ test('applyAnthropicNormalization parses malformed xml parameters tool text into
   assert.equal(toolBlocks[1].input.file_path, 'AGENTS.md');
 });
 
-test('applyAnthropicNormalization synthesizes follow-up tool calls after tool_result when model returns empty content', () => {
+test('applyAnthropicNormalization keeps empty post-tool text empty when no explicit command exists', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_empty_after_tool',
     type: 'message',
@@ -820,11 +816,11 @@ test('applyAnthropicNormalization synthesizes follow-up tool calls after tool_re
     ]
   });
 
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(payload.content.some((block) => block.type === 'tool_use' && block.name === 'Bash'), true);
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.some((block) => block.type === 'tool_use'), false);
 });
 
-test('applyAnthropicNormalization synthesizes follow-up reads after tool_result when model returns short intent text', () => {
+test('applyAnthropicNormalization keeps follow-up intent text as text when no explicit command exists', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_followup_intent',
     type: 'message',
@@ -870,9 +866,8 @@ test('applyAnthropicNormalization synthesizes follow-up reads after tool_result 
   });
 
   const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.some((block) => block.name === 'Read' && block.input.file_path === 'CLAUDE.md'), true);
-  assert.equal(toolBlocks.some((block) => block.name === 'Read' && block.input.file_path === 'AGENTS.md'), true);
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(toolBlocks.length, 0);
 });
 
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
@@ -927,7 +922,7 @@ test('applyAnthropicNormalization parses plain Write filename lines into tool_us
   assert.equal(toolBlock.input.file_path, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\CLAUDE.md');
 });
 
-test('applyAnthropicNormalization does not re-synthesize initial exploration after prior assistant tool use', () => {
+test('applyAnthropicNormalization keeps ordinary completion text after prior assistant tool use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_done_after_tools',
     type: 'message',
