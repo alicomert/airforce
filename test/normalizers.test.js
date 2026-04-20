@@ -1052,6 +1052,7 @@ test('applyAnthropicNormalization synthesizes follow-up after bash cat file read
       {
         role: 'user',
         content: [
+          { type: 'tool_result', tool_use_id: 'toolu_find', content: '/root/airforce/server.js\n/root/airforce/lib/normalizers.js\n/root/airforce/lib/sse.js\n/root/airforce/test/server.test.js\n/root/airforce/test/normalizers.test.js\n/root/airforce/README.md\n/root/airforce/package.json\n/root/airforce/CLAUDE.md' },
           { type: 'tool_result', tool_use_id: 'toolu_pkg', content: '{}' },
           { type: 'tool_result', tool_use_id: 'toolu_readme', content: 'readme' },
           { type: 'tool_result', tool_use_id: 'toolu_claude', content: 'claude' }
@@ -1064,7 +1065,58 @@ test('applyAnthropicNormalization synthesizes follow-up after bash cat file read
   assert.equal(payload.stop_reason, 'tool_use');
   assert.equal(toolBlocks.length, 1);
   assert.equal(toolBlocks[0].name, 'Bash');
-  assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
+  assert.match(toolBlocks[0].input.command, /server\.js/);
+  assert.match(toolBlocks[0].input.command, /lib\/normalizers\.js/);
+});
+
+test('applyAnthropicNormalization synthesizes source-file follow-up after empty exploration step', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_empty_followup',
+    type: 'message',
+    role: 'assistant',
+    content: [],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_find', name: 'Bash', input: { command: "find /root/airforce -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | head -80" } },
+          { type: 'tool_use', id: 'toolu_pkg', name: 'Bash', input: { command: 'cat /root/airforce/package.json' } },
+          { type: 'tool_use', id: 'toolu_readme', name: 'Bash', input: { command: 'cat /root/airforce/README.md 2>/dev/null' } },
+          { type: 'tool_use', id: 'toolu_claude', name: 'Bash', input: { command: 'cat /root/airforce/CLAUDE.md 2>/dev/null' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_find', content: '/root/airforce/server.js\n/root/airforce/lib/normalizers.js\n/root/airforce/lib/sse.js\n/root/airforce/test/server.test.js\n/root/airforce/test/normalizers.test.js\n/root/airforce/README.md\n/root/airforce/package.json\n/root/airforce/CLAUDE.md' },
+          { type: 'tool_result', tool_use_id: 'toolu_pkg', content: '{}' },
+          { type: 'tool_result', tool_use_id: 'toolu_readme', content: 'readme' },
+          { type: 'tool_result', tool_use_id: 'toolu_claude', content: 'claude' }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Bash');
+  assert.match(toolBlocks[0].input.command, /server\.js/);
+  assert.match(toolBlocks[0].input.command, /lib\/normalizers\.js/);
 });
 
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
