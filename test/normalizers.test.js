@@ -674,7 +674,7 @@ test('applyAnthropicNormalization extracts fenced bash even when other tool uses
     role: 'assistant',
     content: [{
       type: 'text',
-      text: '```bash\nls -la /root/airforce/\n```\n<tool_use><server_name>glob</server_name><arguments>{"pattern":"*.md"}</arguments>'
+      text: '```bash\nls -la /workspace/\n```\n<tool_use><server_name>glob</server_name><arguments>{"pattern":"*.md"}</arguments>'
     }],
     stop_reason: 'end_turn'
   }, {
@@ -714,11 +714,11 @@ test('applyAnthropicNormalization extracts fenced bash even when other tool uses
   assert.equal(toolBlocks.length, 2);
   const bashBlock = toolBlocks.find((block) => block.name === 'Bash');
   const globBlock = toolBlocks.find((block) => block.name === 'Glob');
-  assert.equal(bashBlock.input.command, 'ls -la /root/airforce/');
+  assert.equal(bashBlock.input.command, 'ls -la /workspace/');
   assert.equal(globBlock.input.pattern, '*.md');
 });
 
-test('applyAnthropicNormalization keeps text-only exploratory reply as text when no explicit command exists', () => {
+test('applyAnthropicNormalization synthesizes init exploration tools for exploratory reply', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_explore_only',
     type: 'message',
@@ -760,8 +760,10 @@ test('applyAnthropicNormalization keeps text-only exploratory reply as text when
   });
 
   const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'end_turn');
-  assert.equal(toolBlocks.length, 0);
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 2);
+  assert.equal(toolBlocks.find((block) => block.name === 'Bash').input.command, 'find . -maxdepth 2 -type f | head -80');
+  assert.equal(toolBlocks.find((block) => block.name === 'Glob').input.pattern, '*.md');
 });
 
 test('applyAnthropicNormalization drops empty bare Skill tool line', () => {
