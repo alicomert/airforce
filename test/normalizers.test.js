@@ -1020,6 +1020,53 @@ test('applyAnthropicNormalization synthesizes narrow follow-up for key-source-fi
   assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
 });
 
+test('applyAnthropicNormalization synthesizes follow-up after bash cat file reads', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_cat_followup',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: "I'll start by exploring the codebase structure and key files." }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_pkg', name: 'Bash', input: { command: 'cat /root/airforce/package.json' } },
+          { type: 'tool_use', id: 'toolu_readme', name: 'Bash', input: { command: 'cat /root/airforce/README.md 2>/dev/null' } },
+          { type: 'tool_use', id: 'toolu_claude', name: 'Bash', input: { command: 'cat /root/airforce/CLAUDE.md 2>/dev/null' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_pkg', content: '{}' },
+          { type: 'tool_result', tool_use_id: 'toolu_readme', content: 'readme' },
+          { type: 'tool_result', tool_use_id: 'toolu_claude', content: 'claude' }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Bash');
+  assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
+});
+
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_plain_read',
