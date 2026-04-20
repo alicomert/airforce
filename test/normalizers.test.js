@@ -240,6 +240,34 @@ test('applyAnthropicNormalization remaps inline bash shorthand into bash tool in
   assert.equal(payload.content[0].input.command, 'find');
 });
 
+test('applyAnthropicNormalization splits concatenated Bash command carrier', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_concat',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '<tool_call>Bashfind . -maxdepth 3 -type f | sort' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlock.name, 'Bash');
+  assert.equal(toolBlock.input.command, 'find . -maxdepth 3 -type f | sort');
+});
+
 test('applyAnthropicNormalization parses xml server_name tool use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_glob',
