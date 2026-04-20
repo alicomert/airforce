@@ -932,6 +932,51 @@ test('applyAnthropicNormalization keeps follow-up intent text as text when no ex
   assert.equal(toolBlocks.length, 0);
 });
 
+test('applyAnthropicNormalization synthesizes narrow follow-up after read results for remaining-files intent', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_remaining_files_followup',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Let me check the remaining files for completeness.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: 'README-BENI OKU.txt' } },
+          { type: 'tool_use', id: 'toolu_b', name: 'Read', input: { file_path: 'goodbyedpi_gui.py' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_a', content: 'readme' },
+          { type: 'tool_result', tool_use_id: 'toolu_b', content: 'python' }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Bash');
+  assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
+});
+
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_plain_read',
