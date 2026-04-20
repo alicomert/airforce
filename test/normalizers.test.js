@@ -981,3 +981,28 @@ test('applyAnthropicNormalization strips malformed trailing slash-angle from bas
   const toolBlock = payload.content.find((block) => block.type === 'tool_use');
   assert.equal(toolBlock.input.command, 'find . -type f -name "*.php" | head -30');
 });
+
+test('applyAnthropicNormalization strips trailing closing bash tag from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bad_bash_tag_suffix',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>find . -maxdepth 1 -type f | head -30</bash>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'find . -maxdepth 1 -type f | head -30');
+});
