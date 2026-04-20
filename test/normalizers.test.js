@@ -1111,3 +1111,28 @@ test('applyAnthropicNormalization strips trailing quoted ify artifact from bash 
   const toolBlock = payload.content.find((block) => block.type === 'tool_use');
   assert.equal(toolBlock.input.command, 'cat README.md 2>/dev/null || echo "---NO README---"');
 });
+
+test('applyAnthropicNormalization strips trailing think prose from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bad_bash_think_suffix',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>echo "done"</think>I created the file successfully.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'echo "done"');
+});
