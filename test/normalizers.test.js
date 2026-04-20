@@ -729,6 +729,33 @@ test('applyAnthropicNormalization keeps text-only exploratory reply as text when
   assert.equal(toolBlocks.length, 0);
 });
 
+test('applyAnthropicNormalization drops empty bare Skill tool line', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bare_skill',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: "I'll analyze the repo.\n\nskill" }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Skill',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          prompt: { type: 'string' }
+        },
+        required: ['prompt']
+      }
+    }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((block) => block.type === 'tool_use').length, 0);
+  assert.equal(payload.content[0].type, 'text');
+  assert.match(payload.content[0].text, /I'll analyze the repo/);
+});
+
 test('applyAnthropicNormalization does not synthesize exploration tools for ordinary short replies without action context', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_plain_short',
