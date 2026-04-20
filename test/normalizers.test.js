@@ -1029,6 +1029,71 @@ test('applyAnthropicNormalization parses plain Write filename lines into tool_us
   assert.equal(toolBlock.input.file_path, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\CLAUDE.md');
 });
 
+test('applyAnthropicNormalization maps delete_file tool use into Bash rm command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_delete_file_alias',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_delete', name: 'delete_file', input: { path: 'C:\\Users\\ali64\\Documents\\x.cmd' } }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' },
+          description: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Bash');
+  assert.equal(toolBlock.input.command, "rm -f -- 'C:\\Users\\ali64\\Documents\\x.cmd'");
+});
+
+test('applyOpenAiChatNormalization fills write path and content from generic fields', () => {
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_write',
+    object: 'chat.completion',
+    created: 0,
+    model: 'demo',
+    choices: [{
+      index: 0,
+      finish_reason: 'stop',
+      message: {
+        role: 'assistant',
+        content: '```json\n{"name":"Write","arguments":{"path":"CLAUDE.md","text":"hello"}}\n```'
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'Write',
+        parameters: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            file_path: { type: 'string' },
+            content: { type: 'string' }
+          },
+          required: ['file_path', 'content']
+        }
+      }
+    }]
+  });
+
+  const args = JSON.parse(payload.choices[0].message.tool_calls[0].function.arguments);
+  assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'Write');
+  assert.equal(args.file_path, 'CLAUDE.md');
+  assert.equal(args.content, 'hello');
+});
+
 test('applyAnthropicNormalization keeps ordinary completion text after prior assistant tool use', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_done_after_tools',
