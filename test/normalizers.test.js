@@ -170,6 +170,13 @@ test('extractPseudoToolCalls strips malformed filesystem server marker noise', (
   assert.equal(parsed.toolCalls.length, 0);
 });
 
+test('extractPseudoToolCalls strips standalone tool_use marker with leading whitespace', () => {
+  const parsed = extractPseudoToolCalls('  tool_use>\nRead README.md');
+  assert.equal(parsed.text, '');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'Read');
+});
+
 test('extractPseudoToolCalls strips standalone filesystem marker lines around normal text', () => {
   const parsed = extractPseudoToolCalls('tool_use>\n<server_name>filesystem</server_name>\nLet me read the key files.');
   assert.equal(parsed.text, 'Let me read the key files.');
