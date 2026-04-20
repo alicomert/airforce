@@ -164,6 +164,18 @@ test('extractPseudoToolCalls parses claude-style angle tool shorthand', () => {
   assert.equal(parsed.toolCalls[0].input.value, 'find');
 });
 
+test('extractPseudoToolCalls strips malformed filesystem server marker noise', () => {
+  const parsed = extractPseudoToolCalls('tool_use>\n<server_name>filesystem</server_name>');
+  assert.equal(parsed.text, '');
+  assert.equal(parsed.toolCalls.length, 0);
+});
+
+test('extractPseudoToolCalls strips standalone filesystem marker lines around normal text', () => {
+  const parsed = extractPseudoToolCalls('tool_use>\n<server_name>filesystem</server_name>\nLet me read the key files.');
+  assert.equal(parsed.text, 'Let me read the key files.');
+  assert.equal(parsed.toolCalls.length, 0);
+});
+
 test('applyOpenAiChatNormalization remaps loose read line into filePath', () => {
   const payload = applyOpenAiChatNormalization({
     id: 'chatcmpl_4',
@@ -810,4 +822,116 @@ test('applyAnthropicNormalization synthesizes follow-up tool calls after tool_re
 
   assert.equal(payload.stop_reason, 'tool_use');
   assert.equal(payload.content.some((block) => block.type === 'tool_use' && block.name === 'Bash'), true);
+});
+
+test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_plain_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Read README.md' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' }
+        },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'README.md');
+});
+
+test('applyAnthropicNormalization parses plain Write filename lines into tool_use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_plain_write',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Write C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\CLAUDE.md' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' }
+        },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.name, 'Write');
+  assert.equal(toolBlock.input.file_path, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\CLAUDE.md');
+});
+
+test('applyAnthropicNormalization does not re-synthesize initial exploration after prior assistant tool use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_done_after_tools',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Done.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }],
+    messages: [
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'toolu_prev', name: 'Bash', input: { command: 'find .' } }]
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_prev', content: 'ok' }]
+      }
+    ]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((block) => block.type === 'tool_use').length, 0);
+});
+
+test('applyAnthropicNormalization strips malformed trailing slash-angle from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bad_bash_suffix',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>find . -type f -name "*.php" | head -30</' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'find . -type f -name "*.php" | head -30');
 });
