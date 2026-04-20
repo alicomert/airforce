@@ -1006,3 +1006,53 @@ test('applyAnthropicNormalization strips trailing closing bash tag from bash com
   const toolBlock = payload.content.find((block) => block.type === 'tool_use');
   assert.equal(toolBlock.input.command, 'find . -maxdepth 1 -type f | head -30');
 });
+
+test('applyAnthropicNormalization strips trailing sortify artifact from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bad_bash_sortify_suffix',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>find . -maxdepth 3 -type f -name "*.php" | sortify>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'find . -maxdepth 3 -type f -name "*.php" |');
+});
+
+test('applyAnthropicNormalization strips trailing quoted ify artifact from bash command', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bad_bash_ify_suffix',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Bash>cat README.md 2>/dev/null || echo "---NO README---"ify>' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((block) => block.type === 'tool_use');
+  assert.equal(toolBlock.input.command, 'cat README.md 2>/dev/null || echo "---NO README---"');
+});
