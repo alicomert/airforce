@@ -3089,6 +3089,63 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
 });
 
+test('sanitizeCommand strips fake prompt prefix like "wise>" / "bash>" / "shell>"', () => {
+  // Real log regression: model emitted Bash(command='wise> cat "C:\\Users\\..."').
+  // The "wise>" is a hallucinated shell prompt prefix that makes bash fail
+  // ("wise>: command not found"). Model-agnostic: any single word + '>'
+  // followed by a whitelisted command name gets stripped.
+  const cases = [
+    { input: 'wise> cat index.html', expect: 'cat index.html' },
+    { input: 'bash> ls -la', expect: 'ls -la' },
+    { input: 'shell> find . -name "*.md"', expect: 'find . -name "*.md"' },
+    { input: 'prompt> git status', expect: 'git status' }
+  ];
+
+  for (const { input, expect } of cases) {
+    const payload = applyAnthropicNormalization({
+      id: 'msg',
+      type: 'message',
+      role: 'assistant',
+      content: [{
+        type: 'tool_use',
+        id: 'toolu_test',
+        name: 'Bash',
+        input: { command: input }
+      }],
+      stop_reason: 'tool_use'
+    }, {
+      tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }]
+    });
+
+    const toolUse = payload.content.find((b) => b?.type === 'tool_use');
+    if (toolUse) {
+      assert.equal(toolUse.input.command, expect, `input '${input}' should produce '${expect}'`);
+    }
+  }
+});
+
+test('sanitizeCommand preserves real redirect/pipe "echo x > file"', () => {
+  // Counter-test: shell redirects and pipes must stay intact.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_redirect',
+      name: 'Bash',
+      input: { command: 'echo hello > /tmp/x.txt' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }]
+  });
+
+  const toolUse = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolUse);
+  assert.equal(toolUse.input.command, 'echo hello > /tmp/x.txt', 'redirect operator preserved');
+});
+
 test('canonicalize Bash(cat X) does NOT convert to Read if X already read in prior turn', () => {
   // Real log regression: Bash(cat manifest.json) was converted to Read(manifest.json),
   // then suppressRepeatedReadToolCalls dropped it (already read), leaving NO
