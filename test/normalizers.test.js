@@ -1272,3 +1272,69 @@ test('applyAnthropicNormalization strips trailing think prose from bash command'
   const toolBlock = payload.content.find((block) => block.type === 'tool_use');
   assert.equal(toolBlock.input.command, 'echo "done"');
 });
+
+test('applyAnthropicNormalization collapses parallel bash tool_use blocks to a single call', () => {
+  // Regression: upstream modelleri tek turda 5-6 bash call'u birden atiyor.
+  // Anthropic istemcileri (Claude Code) bunlari paralel calistirir, biri fail
+  // edince "parallel tool call errored" ile kalanlari iptal eder ve sistem
+  // kilitlenir. Proxy ayni turda birden fazla bash varsa sadece ilkini birakir.
+  // Komut icerigi HIC degistirilmez, sadece paralel duplicate'lar elenir.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_parallel_bash',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'find /some/path -maxdepth 3' } },
+      { type: 'tool_use', id: 'toolu_2', name: 'Bash', input: { command: 'cd /some/path && ls -la' } },
+      { type: 'tool_use', id: 'toolu_3', name: 'Bash', input: { command: 'cat /some/path/index.html' } },
+      { type: 'tool_use', id: 'toolu_4', name: 'Bash', input: { command: 'powershell.exe -Command "Get-ChildItem"' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          command: { type: 'string' }
+        },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Bash');
+  // Komut icerigi degistirilmemis olmali (ilk call aynen gecer)
+  assert.equal(toolBlocks[0].input.command, 'find /some/path -maxdepth 3');
+});
+
+test('applyAnthropicNormalization preserves parallel read+bash mix (different tools)', () => {
+  // Collapse sadece ayni STATEFUL tool icin yapiliyor. Farkli tool'larin paralel
+  // calismasi OK (read stateless, bash stateful).
+  const payload = applyAnthropicNormalization({
+    id: 'msg_mix_tools',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } },
+      { type: 'tool_use', id: 'toolu_2', name: 'Read', input: { file_path: 'README.md' } },
+      { type: 'tool_use', id: 'toolu_3', name: 'Read', input: { file_path: 'AGENTS.md' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', additionalProperties: false, properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', additionalProperties: false, properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  // 1 bash + 2 read: read stateless oldugu icin ikisi de korunur, bash 1 kalir
+  assert.equal(toolBlocks.length, 3);
+  assert.equal(toolBlocks.filter((b) => b.name === 'Bash').length, 1);
+  assert.equal(toolBlocks.filter((b) => b.name === 'Read').length, 2);
+});
