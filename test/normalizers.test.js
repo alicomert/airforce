@@ -2364,3 +2364,158 @@ test('applyOpenAiChatNormalization handles malformed JSON arguments gracefully',
   assert.ok(Array.isArray(payload.choices[0].message.tool_calls));
   assert.equal(payload.choices[0].message.tool_calls.length, 1);
 });
+
+test('drops upstream tool_use Read with empty input (no file_path)', () => {
+  // Upstream bazen (ozellikle glm-5) {type:'tool_use', name:'Read', input:{}}
+  // gonderiyor. coerceToolInput path alanlarini undefined ile dolduruyordu;
+  // eski dropEmptyBrokenToolCalls `Object.keys(input).length === 0` kontrolu
+  // yaptigi icin dusmuyordu -> client Zod validation error atip donuyordu.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_broken_read',
+      name: 'Read',
+      input: {}
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  // Broken Read dusuruldu, tool_use yok, stop_reason end_turn'e indirildi.
+  assert.equal(payload.stop_reason, 'end_turn');
+  const toolUseBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUseBlocks.length, 0);
+});
+
+test('drops upstream tool_use Glob with empty input (no pattern)', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_broken_glob',
+      name: 'Glob',
+      input: {}
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  const toolUseBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUseBlocks.length, 0);
+});
+
+test('drops bash tool_use with only tool-name as command (context/Bash/:message=...)', () => {
+  // Upstream bazen Bash(command="context") ya da Bash(command=":message=...")
+  // gibi anlamsiz komutlar gonderiyor. Bunlar /bin/bash: exit 127 uretiyor ve
+  // ajan loop'u kiliyor. Bu bogus komutlar drop edilmeli.
+  for (const bogusCommand of ['context', 'Bash', ':message="Update test"', '-message=foo', '--param=bar']) {
+    const payload = applyAnthropicNormalization({
+      id: 'msg',
+      type: 'message',
+      role: 'assistant',
+      content: [{
+        type: 'tool_use',
+        id: 'toolu_bogus_bash',
+        name: 'Bash',
+        input: { command: bogusCommand }
+      }],
+      stop_reason: 'tool_use'
+    }, {
+      tools: [{
+        name: 'Bash',
+        input_schema: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command']
+        }
+      }]
+    });
+
+    const toolUseBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+    assert.equal(toolUseBlocks.length, 0, `bogus command should be dropped: ${bogusCommand}`);
+  }
+});
+
+test('intent synthesis picks a file after Glob tool_result when model emits broken Read', () => {
+  // Conversation: user -> assistant uses Glob -> tool_result contains AGENTS.md
+  // -> assistant emits broken Read with no file_path -> we drop it and
+  // intent synthesis should pick AGENTS.md from the glob result.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_broken_read',
+      name: 'Read',
+      input: {}
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }, {
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'incele' },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_glob_1',
+          name: 'Glob',
+          input: { pattern: '**/*' }
+        }]
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_glob_1',
+          content: 'AGENTS.md\npackage.json\nserver.js\n'
+        }]
+      }
+    ]
+  });
+
+  const toolUseBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  // Broken Read dusuruldu ama intent synthesis Read(AGENTS.md) sentezledi.
+  assert.equal(toolUseBlocks.length, 1);
+  assert.equal(toolUseBlocks[0].name, 'Read');
+  const readPath = toolUseBlocks[0].input?.file_path ?? toolUseBlocks[0].input?.filePath ?? toolUseBlocks[0].input?.path;
+  // AGENTS.md en oncelikli dosya (KEY_FILE_PRIORITY)
+  assert.equal(String(readPath).toLowerCase(), 'agents.md');
+});
