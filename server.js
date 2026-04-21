@@ -14,6 +14,7 @@ import {
   anthropicSseFromMessage,
   openAiChatSseFromCompletion
 } from './lib/sse.js';
+import { injectSystemPromptForPath } from './lib/system-prompt-injection.js';
 
 const PORT = Number(process.env.PORT || 2393);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -304,12 +305,15 @@ const server = http.createServer(async (req, res) => {
       }
     }
     const upstreamBody = parsedBody
-      ? normalizeRequestTools(
-        normalizeRequestMessages(
-          maybeRewriteModel(bodyToNormalize, MODEL_ALIASES),
+      ? injectSystemPromptForPath(
+        upstreamPath,
+        normalizeRequestTools(
+          normalizeRequestMessages(
+            maybeRewriteModel(bodyToNormalize, MODEL_ALIASES),
+            upstreamPath
+          ),
           upstreamPath
-        ),
-        upstreamPath
+        )
       )
       : null;
     if (upstreamBody?.messages) {

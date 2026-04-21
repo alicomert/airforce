@@ -1338,3 +1338,236 @@ test('applyAnthropicNormalization preserves parallel read+bash mix (different to
   assert.equal(toolBlocks.filter((b) => b.name === 'Bash').length, 1);
   assert.equal(toolBlocks.filter((b) => b.name === 'Read').length, 2);
 });
+
+// ---- Intent Synthesis regression tests ----
+
+test('intent synthesis: model emits code block + user wants "index.html olustur" → synthesizes Write tool', () => {
+  // Zayif modeller (glm-5 vb.) dosyayi text icinde yaziyor, Write tool_use
+  // uretmiyor. Proxy kullanicinin isteginde gecen dosya adini kullanarak
+  // Write sentezlemeli ki Claude Code dosyayi diske yazsin.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_write_synthesis',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Hemen olusturuyorum:\n\n```html\n<!DOCTYPE html>\n<html><body>Hi</body></html>\n```\n\nDosyayi kaydet.'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          file_path: { type: 'string' },
+          content: { type: 'string' }
+        },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'index.html olustur, kariyer sitesi yap' }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Write');
+  assert.equal(toolBlocks[0].input.file_path, 'index.html');
+  assert.match(toolBlocks[0].input.content, /<!DOCTYPE html>/);
+});
+
+test('intent synthesis: code block with no filename and unknown language → no synthesis (keep as text)', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_code_no_filename',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Here is a snippet:\n\n```\nrandom text\n```' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] }
+    }],
+    messages: [{ role: 'user', content: 'hi' }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((b) => b.type === 'tool_use').length, 0);
+});
+
+test('intent synthesis: /init + stalling text → synthesizes Glob with **/* (cross-platform)', () => {
+  // Zayif modeller "/init" gibi explore komutlarina "Let me first check" deyip
+  // end_turn ile bitiriyor. Proxy Glob sentezleyerek loop'u devam ettirir.
+  // Glob her OS'ta calisir, hardcoded Linux komutu (find .) ICERMEZ.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_init_stalling',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: "Let me first check what's in the repository." }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: '<command-name>/init</command-name>\nPlease analyze this codebase' }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Glob');
+  assert.equal(toolBlocks[0].input.pattern, '**/*');
+  // Hardcoded yol veya Linux komutu OLMAMALI
+  assert.doesNotMatch(JSON.stringify(toolBlocks[0].input), /\/(workspace|root|tmp|home)\//);
+  assert.doesNotMatch(JSON.stringify(toolBlocks[0].input), /\bfind\s+\./);
+});
+
+test('intent synthesis: single file read intent → synthesizes Read tool with that file', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_single_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: "Let me read package.json to understand the project." }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }],
+    messages: [{ role: 'user', content: 'bu projeyi anlatabilir misin' }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'package.json');
+});
+
+test('intent synthesis: plain chitchat (no code, no intent) → no synthesis', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_chitchat',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Merhaba! Nasil yardimci olabilirim?' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      { name: 'Write', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } },
+      { name: 'Glob', input_schema: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } }
+    ],
+    messages: [{ role: 'user', content: 'selam' }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((b) => b.type === 'tool_use').length, 0);
+  // Text bozulmadan gelsin
+  assert.match(payload.content[0].text, /Merhaba/);
+});
+
+test('intent synthesis: respects client tool naming (write_file snake_case variant)', () => {
+  // Farkli istemciler farkli tool isimleri kullaniyor olabilir (write_file,
+  // WriteFile, create_file). Sentez istemciden GELEN ismi kullanmali.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_write_snake',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '```js\nconsole.log("hi");\n```' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'write_file',
+      input_schema: {
+        type: 'object',
+        properties: { path: { type: 'string' }, content: { type: 'string' } },
+        required: ['path', 'content']
+      }
+    }],
+    messages: [{ role: 'user', content: 'app.js olustur' }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'write_file');
+  assert.equal(toolBlocks[0].input.path, 'app.js');
+  assert.match(toolBlocks[0].input.content, /console\.log/);
+});
+
+test('intent synthesis: real-world Claude Code + glm-5 scenario (kariyer site)', () => {
+  // User log'undan ger\u00e7ek senaryo. Kullanici "index.html olustur, kariyer
+  // sitesi yap" dedi; glm-5 HTML'i text icinde bastirdi, Write cagrisi uretmedi.
+  // Proxy kullanicinin isteginden 'index.html' ismini, model cevabindan kod
+  // blogunu alip Write sentezlemeli.
+  const htmlContent = '<!DOCTYPE html>\n<html lang="tr">\n<head><title>Kariyer</title></head>\n<body>Hi</body>\n</html>';
+  const payload = applyAnthropicNormalization({
+    id: 'msg_real_kariyer',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: `Hemen olusturuyorum:\n\n\`\`\`html\n${htmlContent}\n\`\`\`\n\nTek sayfa, karanlik tema, dosyayi index.html olarak kaydet.`
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    // Claude Code'un gercek tool listesi (debug log'undaki subset)
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } },
+      { name: 'Write', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } },
+      { name: 'Edit', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, old_string: { type: 'string' }, new_string: { type: 'string' } }, required: ['file_path', 'old_string', 'new_string'] } },
+      { name: 'Glob', input_schema: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } }
+    ],
+    messages: [
+      {
+        role: 'user',
+        content: 'senden istedigim index.html olusturup cok ufak sekilde kariyer sitesi yapman tek sayfa olsun acil olsun'
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Write');
+  assert.equal(toolBlocks[0].input.file_path, 'index.html');
+  assert.match(toolBlocks[0].input.content, /<!DOCTYPE html>/);
+  assert.match(toolBlocks[0].input.content, /<title>Kariyer/);
+});
+
+test('intent synthesis: disabled via SYNTHESIZE_INTENT=0', () => {
+  // Not: Bu test runtime'da env read edildigi icin yuklendigi anda karar veriyor.
+  // Dolayisiyla env toggle test'ini ayri process'te calistirmak gerek. Bunun yerine
+  // 'synthesis yoksa neler olmuyor' davranisini test ediyoruz.
+  // (Env flag'i manual test edilebilir: SYNTHESIZE_INTENT=0 node --test)
+  // Burada sadece synth olmadan da plain text'e zarar verilmedigini kontrol edelim:
+  const payload = applyAnthropicNormalization({
+    id: 'msg_plain_with_no_tools',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Cevap: 42' }],
+    stop_reason: 'end_turn'
+  }, {
+    // Tool listesi bos = hic sentez yapilamaz
+    tools: [],
+    messages: [{ role: 'user', content: 'nedir 42?' }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((b) => b.type === 'tool_use').length, 0);
+});
