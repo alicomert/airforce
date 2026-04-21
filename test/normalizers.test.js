@@ -3089,6 +3089,97 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
 });
 
+test('drops Bash with capitalized single-word like "Error" / "Result" (hallucinated non-command)', () => {
+  // Real log: glm-5 emitted Bash(command='Error'). This is a hallucinated
+  // capitalized noun, not a shell command. bash returns "Error: command not
+  // found" which breaks the agent loop. Drop it so a retry has a chance.
+  for (const bogus of ['Error', 'Result', 'Output', 'Response', 'Success', 'Failure', 'OUTPUT']) {
+    const payload = applyAnthropicNormalization({
+      id: 'msg',
+      type: 'message',
+      role: 'assistant',
+      content: [{
+        type: 'tool_use',
+        id: 'toolu_bogus_noun',
+        name: 'Bash',
+        input: { command: bogus }
+      }],
+      stop_reason: 'tool_use'
+    }, {
+      tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }]
+    });
+
+    const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+    assert.equal(toolBlocks.length, 0, `capitalized noun '${bogus}' should be dropped as bogus bash command`);
+  }
+});
+
+test('preserves legitimate PowerShell capitalized cmdlets like Get-Content', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_ps',
+      name: 'Bash',
+      input: { command: 'Get-Content file.txt' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  // Get-Content might get rewritten to Read, but should NOT be dropped.
+  assert.equal(toolBlocks.length, 1, 'Get-Content must not be dropped as bogus');
+});
+
+test('drops Bash with shell variable assignment like cmd="ls -la"', () => {
+  // Real log: glm-5 emitted Bash(command='cmd="ls -la"'). This is a shell
+  // variable assignment, not a command. bash assigns the variable and returns
+  // with no output. Drop.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_assign',
+      name: 'Bash',
+      input: { command: 'command="cat service-worker.js"' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 0, 'pure variable assignment should be dropped as bogus');
+});
+
+test('drops Read with XML tag as file_path (hallucinated instrumentation leak)', () => {
+  // Real log: glm-5 emitted Read with file_path='<system-reminder>...</systemResult>'.
+  // Model is leaking instrumentation tag into the path value.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_tag_in_path',
+      name: 'Read',
+      input: { file_path: '`<system-reminder>The tool ran without output.</systemResult>`' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 0, 'Read with XML tag in path should be dropped');
+});
+
 test('sanitizeCommand strips fake prompt prefix like "wise>" / "bash>" / "shell>"', () => {
   // Real log regression: model emitted Bash(command='wise> cat "C:\\Users\\..."').
   // The "wise>" is a hallucinated shell prompt prefix that makes bash fail
