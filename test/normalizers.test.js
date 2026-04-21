@@ -718,54 +718,6 @@ test('applyAnthropicNormalization extracts fenced bash even when other tool uses
   assert.equal(globBlock.input.pattern, '*.md');
 });
 
-test('applyAnthropicNormalization synthesizes init exploration tools for exploratory reply', () => {
-  const payload = applyAnthropicNormalization({
-    id: 'msg_explore_only',
-    type: 'message',
-    role: 'assistant',
-    content: [{ type: 'text', text: "I'll analyze the codebase to understand its architecture and create an improved CLAUDE.md." }],
-    stop_reason: 'end_turn'
-  }, {
-    tools: [
-      {
-        name: 'Bash',
-        input_schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            command: { type: 'string' },
-            description: { type: 'string' }
-          },
-          required: ['command']
-        }
-      },
-      {
-        name: 'Glob',
-        input_schema: {
-          type: 'object',
-          additionalProperties: false,
-          properties: {
-            pattern: { type: 'string' }
-          },
-          required: ['pattern']
-        }
-      }
-    ],
-    messages: [
-      {
-        role: 'user',
-        content: '<command-message>/init</command-message>'
-      }
-    ]
-  });
-
-  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.length, 2);
-  assert.equal(toolBlocks.find((block) => block.name === 'Bash').input.command, 'find . -maxdepth 2 -type f | head -80');
-  assert.equal(toolBlocks.find((block) => block.name === 'Glob').input.pattern, '*.md');
-});
-
 test('applyAnthropicNormalization drops empty bare Skill tool line', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_bare_skill',
@@ -934,12 +886,16 @@ test('applyAnthropicNormalization keeps follow-up intent text as text when no ex
   assert.equal(toolBlocks.length, 0);
 });
 
-test('applyAnthropicNormalization synthesizes narrow follow-up after read results for remaining-files intent', () => {
+test('applyAnthropicNormalization does not inject synthetic exploration tool calls when upstream produced none', () => {
+  // Regression: eski surumlerde proxy, upstream hic tool_use uretmediginde kendisi
+  // 'find . -maxdepth 2' gibi Linux'a ozgu komutlar enjekte ediyordu. Bu proje-agnostik
+  // olmayi ve Windows/macOS/Linux hepsinde calismayi bozuyordu. Artik proxy sadece
+  // upstream'in gercek ciktisini normalize eder, kendisi komut uretmez.
   const payload = applyAnthropicNormalization({
-    id: 'msg_remaining_files_followup',
+    id: 'msg_no_synthesis',
     type: 'message',
     role: 'assistant',
-    content: [{ type: 'text', text: 'Let me check the remaining files for completeness.' }],
+    content: [{ type: 'text', text: "I'll analyze the codebase to understand its architecture." }],
     stop_reason: 'end_turn'
   }, {
     tools: [{
@@ -955,170 +911,12 @@ test('applyAnthropicNormalization synthesizes narrow follow-up after read result
       }
     }],
     messages: [
-      {
-        role: 'assistant',
-        content: [
-          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: 'README-BENI OKU.txt' } },
-          { type: 'tool_use', id: 'toolu_b', name: 'Read', input: { file_path: 'goodbyedpi_gui.py' } }
-        ]
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: 'toolu_a', content: 'readme' },
-          { type: 'tool_result', tool_use_id: 'toolu_b', content: 'python' }
-        ]
-      }
+      { role: 'user', content: '<command-message>/init</command-message>' }
     ]
   });
 
-  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.length, 1);
-  assert.equal(toolBlocks[0].name, 'Bash');
-  assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
-});
-
-test('applyAnthropicNormalization synthesizes narrow follow-up for key-source-files intent', () => {
-  const payload = applyAnthropicNormalization({
-    id: 'msg_key_source_followup',
-    type: 'message',
-    role: 'assistant',
-    content: [{ type: 'text', text: 'Let me read all the key source files first.' }],
-    stop_reason: 'end_turn'
-  }, {
-    tools: [{
-      name: 'Bash',
-      input_schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          command: { type: 'string' },
-          description: { type: 'string' }
-        },
-        required: ['command']
-      }
-    }],
-    messages: [
-      {
-        role: 'assistant',
-        content: [
-          { type: 'tool_use', id: 'toolu_a', name: 'Read', input: { file_path: 'README.md' } }
-        ]
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: 'toolu_a', content: 'readme' }
-        ]
-      }
-    ]
-  });
-
-  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.length, 1);
-  assert.equal(toolBlocks[0].name, 'Bash');
-  assert.equal(toolBlocks[0].input.command, 'find . -maxdepth 2 -type f | head -80');
-});
-
-test('applyAnthropicNormalization synthesizes follow-up after bash cat file reads', () => {
-  const payload = applyAnthropicNormalization({
-    id: 'msg_bash_cat_followup',
-    type: 'message',
-    role: 'assistant',
-    content: [{ type: 'text', text: "I'll start by exploring the codebase structure and key files." }],
-    stop_reason: 'end_turn'
-  }, {
-    tools: [{
-      name: 'Bash',
-      input_schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          command: { type: 'string' },
-          description: { type: 'string' }
-        },
-        required: ['command']
-      }
-    }],
-    messages: [
-      {
-        role: 'assistant',
-        content: [
-          { type: 'tool_use', id: 'toolu_pkg', name: 'Bash', input: { command: 'cat /workspace/package.json' } },
-          { type: 'tool_use', id: 'toolu_readme', name: 'Bash', input: { command: 'cat /workspace/README.md 2>/dev/null' } },
-          { type: 'tool_use', id: 'toolu_claude', name: 'Bash', input: { command: 'cat /workspace/PROJECT.md 2>/dev/null' } }
-        ]
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: 'toolu_find', content: '/workspace/app.js\n/workspace/lib/transform.js\n/workspace/lib/streaming.js\n/workspace/test/app.test.js\n/workspace/README.md\n/workspace/package.json\n/workspace/PROJECT.md' },
-          { type: 'tool_result', tool_use_id: 'toolu_pkg', content: '{}' },
-          { type: 'tool_result', tool_use_id: 'toolu_readme', content: 'readme' },
-          { type: 'tool_result', tool_use_id: 'toolu_claude', content: 'claude' }
-        ]
-      }
-    ]
-  });
-
-  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.length, 1);
-  assert.equal(toolBlocks[0].name, 'Bash');
-  assert.match(toolBlocks[0].input.command, /app\.js/);
-  assert.match(toolBlocks[0].input.command, /lib\/transform\.js/);
-});
-
-test('applyAnthropicNormalization synthesizes source-file follow-up after empty exploration step', () => {
-  const payload = applyAnthropicNormalization({
-    id: 'msg_empty_followup',
-    type: 'message',
-    role: 'assistant',
-    content: [],
-    stop_reason: 'end_turn'
-  }, {
-    tools: [{
-      name: 'Bash',
-      input_schema: {
-        type: 'object',
-        additionalProperties: false,
-        properties: {
-          command: { type: 'string' },
-          description: { type: 'string' }
-        },
-        required: ['command']
-      }
-    }],
-    messages: [
-      {
-        role: 'assistant',
-        content: [
-          { type: 'tool_use', id: 'toolu_find', name: 'Bash', input: { command: "find /workspace -type f -not -path '*/node_modules/*' -not -path '*/.git/*' | head -80" } },
-          { type: 'tool_use', id: 'toolu_pkg', name: 'Bash', input: { command: 'cat /workspace/package.json' } },
-          { type: 'tool_use', id: 'toolu_readme', name: 'Bash', input: { command: 'cat /workspace/README.md 2>/dev/null' } },
-          { type: 'tool_use', id: 'toolu_claude', name: 'Bash', input: { command: 'cat /workspace/PROJECT.md 2>/dev/null' } }
-        ]
-      },
-      {
-        role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: 'toolu_find', content: '/workspace/app.js\n/workspace/lib/transform.js\n/workspace/lib/streaming.js\n/workspace/test/app.test.js\n/workspace/README.md\n/workspace/package.json\n/workspace/PROJECT.md' },
-          { type: 'tool_result', tool_use_id: 'toolu_pkg', content: '{}' },
-          { type: 'tool_result', tool_use_id: 'toolu_readme', content: 'readme' },
-          { type: 'tool_result', tool_use_id: 'toolu_claude', content: 'claude' }
-        ]
-      }
-    ]
-  });
-
-  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
-  assert.equal(payload.stop_reason, 'tool_use');
-  assert.equal(toolBlocks.length, 1);
-  assert.equal(toolBlocks[0].name, 'Bash');
-  assert.match(toolBlocks[0].input.command, /app\.js/);
-  assert.match(toolBlocks[0].input.command, /lib\/transform\.js/);
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.filter((block) => block.type === 'tool_use').length, 0);
 });
 
 test('applyAnthropicNormalization parses plain Read filename lines into tool_use', () => {

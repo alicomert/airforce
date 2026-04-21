@@ -21,6 +21,15 @@ const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || 'https://api.airforc
 const DEFAULT_API_KEY = process.env.AIRFORCE_API_KEY || '';
 const MODEL_ALIASES = parseAliases(process.env.MODEL_ALIASES);
 const DEBUG_LOGS = process.env.DEBUG_LOGS !== '0';
+// Upstream retry config: "API hic durmasin" istegi dogrultusunda, network hatasi /
+// 5xx / bos cevap durumunda upstream'i tekrar cagir. Saniye bazli backoff.
+const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || 6));
+const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.UPSTREAM_RETRY_BASE_MS || 500));
+const UPSTREAM_RETRY_MAX_MS = Math.max(1000, Number(process.env.UPSTREAM_RETRY_MAX_MS || 8000));
+// Tek bir upstream isteginin max suresi (ms). Uzun modeller icin rahat olsun diye 5dk default.
+const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || 300000));
+// Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
+const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
 
 function parseAliases(raw) {
   if (!raw) {
@@ -121,6 +130,93 @@ function mapUpstreamPath(pathname) {
     return pathname.slice('/anthropic'.length) || '/';
   }
   return pathname;
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function backoffDelay(attempt) {
+  const exp = UPSTREAM_RETRY_BASE_MS * Math.pow(2, attempt - 1);
+  const capped = Math.min(exp, UPSTREAM_RETRY_MAX_MS);
+  // Jitter: +/-25%
+  const jitter = capped * (0.75 + Math.random() * 0.5);
+  return Math.floor(jitter);
+}
+
+function isRetriableStatus(status) {
+  // 408 timeout, 425 too early, 429 rate limit, 5xx server errors
+  return status === 408 || status === 425 || status === 429 || (status >= 500 && status < 600);
+}
+
+// Normalize sonrasi cevap gercekten bos mu? Anthropic: content[] tamamen bos/text-empty
+// ve tool_use yok. OpenAI chat: choices bos veya tum choice'larin mesaji bos ve tool_call yok.
+function isEffectivelyEmpty(pathname, payload) {
+  if (!payload || typeof payload !== 'object') {
+    return true;
+  }
+  if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
+    if (!Array.isArray(payload.content)) {
+      return true;
+    }
+    const hasToolUse = payload.content.some((b) => b?.type === 'tool_use');
+    const hasThinking = payload.content.some((b) => b?.type === 'thinking' && typeof b?.thinking === 'string' && b.thinking.trim().length > 0);
+    const hasText = payload.content.some((b) => b?.type === 'text' && typeof b?.text === 'string' && b.text.trim().length > 0);
+    return !hasToolUse && !hasText && !hasThinking;
+  }
+  if (pathname.endsWith('/chat/completions')) {
+    if (!Array.isArray(payload.choices) || payload.choices.length === 0) {
+      return true;
+    }
+    return payload.choices.every((choice) => {
+      const msg = choice?.message;
+      const hasContent = typeof msg?.content === 'string' && msg.content.trim().length > 0;
+      const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
+      return !hasContent && !hasToolCalls;
+    });
+  }
+  return false;
+}
+
+// Upstream'e fetch + timeout + retry. Network hatasi, 5xx, 408/425/429'da otomatik yeniden dener.
+// 4xx (429 disinda) ve 2xx/3xx durumunda response'u oldugu gibi dondurur.
+async function fetchUpstreamWithRetry(upstreamUrl, fetchOptions, logLabel) {
+  let lastError = null;
+  let lastResponse = null;
+  for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('upstream-timeout')), UPSTREAM_TIMEOUT_MS);
+    try {
+      const response = await fetch(upstreamUrl, { ...fetchOptions, signal: controller.signal });
+      clearTimeout(timer);
+      if (!isRetriableStatus(response.status)) {
+        return response;
+      }
+      lastResponse = response;
+      logDebug('upstream_retry_status', { attempt, status: response.status, label: logLabel });
+      if (attempt >= UPSTREAM_MAX_ATTEMPTS) {
+        return response;
+      }
+      // Body'yi okuyup at (connection reuse icin)
+      try { await response.text(); } catch { /* ignore */ }
+    } catch (error) {
+      clearTimeout(timer);
+      lastError = error;
+      logDebug('upstream_retry_error', {
+        attempt,
+        label: logLabel,
+        message: error instanceof Error ? error.message : String(error)
+      });
+      if (attempt >= UPSTREAM_MAX_ATTEMPTS) {
+        break;
+      }
+    }
+    await sleep(backoffDelay(attempt));
+  }
+  if (lastResponse) {
+    return lastResponse;
+  }
+  throw lastError ?? new Error('Upstream request failed after retries');
 }
 
 function appendAliasModels(payload) {
@@ -227,17 +323,60 @@ const server = http.createServer(async (req, res) => {
     }
     const encodedUpstreamBody = upstreamBody ? JSON.stringify(upstreamBody) : undefined;
     const upstreamUrl = new URL(upstreamPath + requestUrl.search, UPSTREAM_BASE_URL);
-
-    const upstreamResponse = await fetch(upstreamUrl, {
+    const upstreamFetchOptions = {
       method: req.method,
       headers: buildUpstreamHeaders(req, encodedUpstreamBody ? Buffer.byteLength(encodedUpstreamBody) : null),
       body: encodedUpstreamBody
-    });
+    };
 
-    const contentType = upstreamResponse.headers.get('content-type') || '';
-    const upstreamText = await upstreamResponse.text();
+    // Ana loop: upstream'i cagir, normalize et. Normalize sonrasi cevap effectively
+    // bossa (hic text, hic tool_use) bir kac kez daha upstream'i yeniden cagir. Bu
+    // "model bazen hic cevap uretmiyor" durumunu absorbe eder. Tool loop'un asil
+    // semantigi (stop_reason: end_turn'u respect et) ise client tarafinda zaten
+    // Anthropic/OpenAI SDK'lari tarafindan yonetiliyor.
+    const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? 3 : 0;
+    let upstreamResponse;
+    let contentType = '';
+    let upstreamText = '';
+    let payload = null;
+    let rawPayload = null;
+    let nonJsonPassthrough = false;
 
-    if (!contentType.includes('application/json')) {
+    for (let emptyAttempt = 0; emptyAttempt <= maxEmptyRetries; emptyAttempt += 1) {
+      upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, upstreamFetchOptions, `${req.method} ${upstreamPath}`);
+      contentType = upstreamResponse.headers.get('content-type') || '';
+      upstreamText = await upstreamResponse.text();
+
+      if (!contentType.includes('application/json')) {
+        nonJsonPassthrough = true;
+        break;
+      }
+
+      payload = upstreamText ? JSON.parse(upstreamText) : {};
+      rawPayload = payload;
+      payload = normalizeJsonPayload(requestUrl.pathname, payload, parsedBody);
+      payload = restorePresentedModel(parsedBody, payload);
+
+      // Basarili response ama normalize sonrasi bomboss → bir daha cagir
+      if (
+        upstreamResponse.status >= 200 && upstreamResponse.status < 300 &&
+        RETRY_ON_EMPTY_RESPONSE &&
+        emptyAttempt < maxEmptyRetries &&
+        isEffectivelyEmpty(requestUrl.pathname, payload)
+      ) {
+        logDebug('upstream_empty_payload_retry', {
+          attempt: emptyAttempt + 1,
+          path: requestUrl.pathname,
+          raw_content_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.content) ? rawPayload.content.length : undefined,
+          raw_choices_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.choices) ? rawPayload.choices.length : undefined
+        });
+        await sleep(backoffDelay(emptyAttempt + 1));
+        continue;
+      }
+      break;
+    }
+
+    if (nonJsonPassthrough) {
       res.writeHead(upstreamResponse.status, {
         'content-type': contentType || 'text/plain; charset=utf-8',
         'access-control-allow-origin': '*'
@@ -245,11 +384,6 @@ const server = http.createServer(async (req, res) => {
       res.end(upstreamText);
       return;
     }
-
-    let payload = upstreamText ? JSON.parse(upstreamText) : {};
-    const rawPayload = payload;
-    payload = normalizeJsonPayload(requestUrl.pathname, payload, parsedBody);
-    payload = restorePresentedModel(parsedBody, payload);
     if (
       requestUrl.pathname.includes('/anthropic/') &&
       Array.isArray(rawPayload?.content) &&
@@ -323,9 +457,11 @@ const server = http.createServer(async (req, res) => {
 
     sendJson(res, upstreamResponse.status, payload);
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logDebug('proxy_fatal', { path: requestUrl.pathname, message });
     sendJson(res, 502, {
       error: 'Proxy request failed',
-      details: error instanceof Error ? error.message : String(error)
+      details: message
     });
   }
 });
