@@ -3250,6 +3250,109 @@ test('drops Read with XML tag as file_path (hallucinated instrumentation leak)',
   assert.equal(toolBlocks.length, 0, 'Read with XML tag in path should be dropped');
 });
 
+test('fillSchemaRequiredDefaults: Bash with OpenCode schema gets timeout auto-filled', () => {
+  // Real log regression: OpenCode client declares bash schema with timeout
+  // (number) as required. Weak models (glm-5) don't provide it, client
+  // rejects with 'invalid_type expected number'. Proxy now fills sensible
+  // default (30000ms).
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_bash',
+      name: 'bash',
+      input: { command: 'ls' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'bash',
+      input_schema: {
+        type: 'object',
+        properties: {
+          command: { type: 'string' },
+          timeout: { type: 'number' },
+          workdir: { type: 'string' }
+        },
+        required: ['command', 'timeout']
+      }
+    }]
+  });
+
+  const toolUse = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolUse);
+  assert.equal(typeof toolUse.input.timeout, 'number', 'timeout auto-filled as number');
+  assert.ok(toolUse.input.timeout > 0, 'timeout has positive default');
+});
+
+test('fillSchemaRequiredDefaults: Glob with empty args gets pattern="**/*"', () => {
+  // Real log: glm-5 emitted tool_calls:[{name:"glob", arguments:"{}"}].
+  // Client rejected with 'invalid_type expected string on pattern'.
+  // Proxy fills pattern with **/* as fallback.
+  const payload = applyOpenAiChatNormalization({
+    choices: [{
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: '',
+        tool_calls: [{
+          id: 'call_x',
+          type: 'function',
+          function: { name: 'glob', arguments: '{}' }
+        }]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'glob',
+        parameters: {
+          type: 'object',
+          properties: { pattern: { type: 'string' } },
+          required: ['pattern']
+        }
+      }
+    }]
+  });
+
+  const toolCalls = payload.choices[0].message.tool_calls;
+  assert.ok(Array.isArray(toolCalls));
+  assert.equal(toolCalls.length, 1);
+  const args = JSON.parse(toolCalls[0].function.arguments);
+  assert.equal(args.pattern, '**/*', 'pattern filled with default');
+});
+
+test('fillSchemaRequiredDefaults: preserves existing values, does not overwrite', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_bash',
+      name: 'bash',
+      input: { command: 'ls', timeout: 5000 }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'bash',
+      input_schema: {
+        type: 'object',
+        properties: { command: { type: 'string' }, timeout: { type: 'number' } },
+        required: ['command', 'timeout']
+      }
+    }]
+  });
+
+  const toolUse = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolUse);
+  assert.equal(toolUse.input.timeout, 5000, 'existing timeout preserved');
+});
+
 test('sanitizeCommand strips fake prompt prefix like "wise>" / "bash>" / "shell>"', () => {
   // Real log regression: model emitted Bash(command='wise> cat "C:\\Users\\..."').
   // The "wise>" is a hallucinated shell prompt prefix that makes bash fail
