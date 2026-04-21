@@ -217,7 +217,9 @@ test('applyOpenAiChatNormalization remaps loose read line into filePath', () => 
   const args = JSON.parse(payload.choices[0].message.tool_calls[0].function.arguments);
   assert.equal(payload.choices[0].message.tool_calls[0].function.name, 'read');
   assert.equal(args.filePath, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\AGENTS.md');
-  assert.deepEqual(Object.keys(args), ['filePath']);
+  // Schema sync: both filePath and file_path are populated (client may use either)
+  assert.ok(Object.keys(args).includes('filePath'));
+  assert.ok(Object.keys(args).includes('file_path'));
 });
 
 test('applyAnthropicNormalization remaps inline bash shorthand into bash tool input', () => {
