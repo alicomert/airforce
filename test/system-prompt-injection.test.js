@@ -1,12 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import {
+// System prompt injection default OFF. Test dosyasi top-level import
+// yapiyorsa env'nin import'tan ONCE set edilmesi lazim.
+process.env.INJECT_SYSTEM_PROMPT = '1';
+
+const {
   injectAnthropicSystemPrompt,
   injectOpenAiSystemPrompt,
   injectSystemPromptForPath,
   buildToolContract
-} from '../lib/system-prompt-injection.js';
+} = await import('../lib/system-prompt-injection.js');
 
 const CONTRACT_MARKER = 'airforce-proxy:tool-contract';
 
@@ -222,10 +226,15 @@ test('injectSystemPromptForPath returns body unchanged for unknown path', () => 
   assert.equal(out.system, undefined);
 });
 
-test('contract explicitly instructs model to call tools, not describe actions in text', () => {
-  // Bu contract'in core mesaji: "text'e yazma, tool cagir"
+test('contract suggests (not forces) tool calls and allows plain text', () => {
+  // Contract'in core mesaji: "aksiyon varsa tool call tercih et, ama text de ok".
+  // Rigid "MUST" dayatma yok - model bilmedigi konularda sikismadan text/soru ile
+  // cevap verebilsin. Asiri sikistirma bos cevaplara yol aciyordu.
   const contract = buildToolContract({ tools: claudeCodeTools });
   assert.ok(contract);
-  assert.match(contract, /MUST call/i);
-  assert.match(contract, /instead of .*describing/i);
+  assert.match(contract, /prefer/i);
+  // "MUST" kelimesi gecmemeli (son ton degisikligi)
+  assert.doesNotMatch(contract, /\bMUST\b/);
+  // Model istedigi zaman plain text / clarifying question atabilsin mesajini dahil
+  assert.match(contract, /clarifying|ask|question/i);
 });

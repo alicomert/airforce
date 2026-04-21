@@ -22,15 +22,21 @@ const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || 'https://api.airforc
 const DEFAULT_API_KEY = process.env.AIRFORCE_API_KEY || '';
 const MODEL_ALIASES = parseAliases(process.env.MODEL_ALIASES);
 const DEBUG_LOGS = process.env.DEBUG_LOGS !== '0';
-// Upstream retry config: "API hic durmasin" istegi dogrultusunda, network hatasi /
-// 5xx / bos cevap durumunda upstream'i tekrar cagir. Saniye bazli backoff.
-const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || 6));
-const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.UPSTREAM_RETRY_BASE_MS || 500));
-const UPSTREAM_RETRY_MAX_MS = Math.max(1000, Number(process.env.UPSTREAM_RETRY_MAX_MS || 8000));
-// Tek bir upstream isteginin max suresi (ms). Uzun modeller icin rahat olsun diye 5dk default.
-const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || 300000));
+// Upstream retry config. Network/5xx/408/425/429 icin exponential backoff.
+// Default degerler: hizli ama agresif olmayan. Uzun sureler (kullanicinin
+// "6 dakika bekledim" sikayetleri) icin pratik secimler:
+//   - Attempt sayisi: 4 (3 retry + orjinal deneme). 6 fazla idi.
+//   - Base delay: 300ms. 500 fazla idi.
+//   - Max delay: 3 saniye. 8 saniye asiridir.
+const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || 4));
+const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.UPSTREAM_RETRY_BASE_MS || 300));
+const UPSTREAM_RETRY_MAX_MS = Math.max(500, Number(process.env.UPSTREAM_RETRY_MAX_MS || 3000));
+// Tek bir upstream isteginin max suresi (ms). Uzun modeller icin rahat olsun diye 3dk default.
+const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || 180000));
 // Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
+// Default: 1 retry (asil + 1 tekrar). 3 retry * backoff cok uzun surelere yol aciyor.
 const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
+const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 1));
 
 function parseAliases(raw) {
   if (!raw) {
@@ -177,6 +183,41 @@ function isEffectivelyEmpty(pathname, payload) {
     });
   }
   return false;
+}
+
+// Model bos cevap atmis ve retry'lar da bosa cikmissa, sessizce bos
+// response'u donmek yerine kullaniciya problem hakkinda kisa bir aciklama
+// dondur. Boylece Claude Code / OpenCode gibi istemciler asili kalmaz,
+// kullanici ne olduysa gorur ve tekrar dener / model degistirir.
+const EMPTY_RESPONSE_USER_MESSAGE = 'The upstream model returned an empty response. This sometimes happens with weaker models when a request is ambiguous, too long, or references an unknown topic. Try rephrasing the request, breaking it into smaller steps, or switching to a different model.';
+
+function injectEmptyResponseFallback(pathname, payload) {
+  if (!payload || typeof payload !== 'object') {
+    payload = {};
+  }
+  if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
+    return {
+      ...payload,
+      content: [{ type: 'text', text: EMPTY_RESPONSE_USER_MESSAGE }],
+      stop_reason: payload.stop_reason && payload.stop_reason !== 'tool_use' ? payload.stop_reason : 'end_turn'
+    };
+  }
+  if (pathname.endsWith('/chat/completions')) {
+    const firstChoice = Array.isArray(payload.choices) && payload.choices[0] ? payload.choices[0] : {};
+    return {
+      ...payload,
+      choices: [{
+        ...firstChoice,
+        index: firstChoice.index ?? 0,
+        finish_reason: firstChoice.finish_reason && firstChoice.finish_reason !== 'tool_calls' ? firstChoice.finish_reason : 'stop',
+        message: {
+          role: 'assistant',
+          content: EMPTY_RESPONSE_USER_MESSAGE
+        }
+      }]
+    };
+  }
+  return payload;
 }
 
 // Upstream'e fetch + timeout + retry. Network hatasi, 5xx, 408/425/429'da otomatik yeniden dener.
@@ -334,17 +375,17 @@ const server = http.createServer(async (req, res) => {
     };
 
     // Ana loop: upstream'i cagir, normalize et. Normalize sonrasi cevap effectively
-    // bossa (hic text, hic tool_use) bir kac kez daha upstream'i yeniden cagir. Bu
-    // "model bazen hic cevap uretmiyor" durumunu absorbe eder. Tool loop'un asil
-    // semantigi (stop_reason: end_turn'u respect et) ise client tarafinda zaten
-    // Anthropic/OpenAI SDK'lari tarafindan yonetiliyor.
-    const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? 3 : 0;
+    // bossa (hic text, hic tool_use) 1 kere daha upstream'i yeniden cagir. Bu
+    // "model bazen hic cevap uretmiyor" durumunu absorbe eder. Asiri retry
+    // (3x) istemciyi bekletir - EMPTY_RESPONSE_MAX_RETRIES ile kontrol edilir.
+    const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? EMPTY_RESPONSE_MAX_RETRIES : 0;
     let upstreamResponse;
     let contentType = '';
     let upstreamText = '';
     let payload = null;
     let rawPayload = null;
     let nonJsonPassthrough = false;
+    let lastWasEmpty = false;
 
     for (let emptyAttempt = 0; emptyAttempt <= maxEmptyRetries; emptyAttempt += 1) {
       upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, upstreamFetchOptions, `${req.method} ${upstreamPath}`);
@@ -361,12 +402,15 @@ const server = http.createServer(async (req, res) => {
       payload = normalizeJsonPayload(requestUrl.pathname, payload, parsedBody);
       payload = restorePresentedModel(parsedBody, payload);
 
+      const effectivelyEmpty = isEffectivelyEmpty(requestUrl.pathname, payload);
+      lastWasEmpty = effectivelyEmpty;
+
       // Basarili response ama normalize sonrasi bomboss → bir daha cagir
       if (
         upstreamResponse.status >= 200 && upstreamResponse.status < 300 &&
         RETRY_ON_EMPTY_RESPONSE &&
         emptyAttempt < maxEmptyRetries &&
-        isEffectivelyEmpty(requestUrl.pathname, payload)
+        effectivelyEmpty
       ) {
         logDebug('upstream_empty_payload_retry', {
           attempt: emptyAttempt + 1,
@@ -378,6 +422,16 @@ const server = http.createServer(async (req, res) => {
         continue;
       }
       break;
+    }
+
+    // Retry'lar bitti ve cevap hala bos → sessizce bosa gonderme; kullaniciya
+    // anlamli bir aciklama dondurs ki Claude Code 4+ dakika asili kalmasin.
+    if (
+      !nonJsonPassthrough &&
+      lastWasEmpty &&
+      upstreamResponse?.status >= 200 && upstreamResponse?.status < 300
+    ) {
+      payload = injectEmptyResponseFallback(requestUrl.pathname, payload);
     }
 
     if (nonJsonPassthrough) {
