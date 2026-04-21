@@ -3250,6 +3250,58 @@ test('drops Read with XML tag as file_path (hallucinated instrumentation leak)',
   assert.equal(toolBlocks.length, 0, 'Read with XML tag in path should be dropped');
 });
 
+test('extractPseudoToolCalls parses Anthropic native XML function-calling format', () => {
+  // Real log: Claude/Sonnet style models sometimes emit tool calls as
+  // <function_calls><invoke name="X"><parameter name="Y">Z</parameter>...
+  // This is Anthropic's native XML format but sometimes leaks into text.
+  const sample = `I'll investigate the repository.
+
+<function_calls>
+<invoke name="task">
+<parameter name="description">Explore repo structure</parameter>
+<parameter name="subagent_type">general</parameter>
+</invoke>
+</function_calls>
+
+Let me continue.`;
+
+  const result = extractPseudoToolCalls(sample);
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].name, 'task');
+  assert.equal(result.toolCalls[0].input.description, 'Explore repo structure');
+  assert.equal(result.toolCalls[0].input.subagent_type, 'general');
+  // Text shouldn't contain the XML anymore (cleaned)
+  assert.ok(!result.text.includes('<function_calls>'));
+  assert.ok(!result.text.includes('<invoke'));
+});
+
+test('extractPseudoToolCalls parses inline <invoke> without function_calls wrapper', () => {
+  const sample = `<invoke name="read">
+<parameter name="filePath">package.json</parameter>
+</invoke>`;
+
+  const result = extractPseudoToolCalls(sample);
+  assert.equal(result.toolCalls.length, 1);
+  assert.equal(result.toolCalls[0].name, 'read');
+  assert.equal(result.toolCalls[0].input.filePath, 'package.json');
+});
+
+test('extractPseudoToolCalls handles multiple <invoke> blocks in one function_calls', () => {
+  const sample = `<function_calls>
+<invoke name="read">
+<parameter name="filePath">a.md</parameter>
+</invoke>
+<invoke name="read">
+<parameter name="filePath">b.md</parameter>
+</invoke>
+</function_calls>`;
+
+  const result = extractPseudoToolCalls(sample);
+  assert.equal(result.toolCalls.length, 2);
+  assert.equal(result.toolCalls[0].input.filePath, 'a.md');
+  assert.equal(result.toolCalls[1].input.filePath, 'b.md');
+});
+
 test('applyOpenAiChatNormalization drops read({}) with empty args (OpenCode broken tool call)', () => {
   // Real log regression: OpenCode + glm-5 produced 6x read({}) broken tool
   // calls. Zod validator rejected all with 'expected string on filePath'.
