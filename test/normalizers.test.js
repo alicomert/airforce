@@ -20,7 +20,6 @@ I'll read files.
   assert.equal(parsed.toolCalls[0].input.path, 'C:\\demo\\AGENTS.md');
 });
 
-
 test('extractPseudoToolCalls parses official <tool_use> tags', () => {
   const sample = `<think>internal<[PLHD36_never_used_51bce0c785ca2f68081bfa7d91973934]>
 I'll read files.
@@ -3088,6 +3087,124 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
   assert.ok(toolBlock);
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
+});
+
+test('canonicalize Bash(cat X) does NOT convert to Read if X already read in prior turn', () => {
+  // Real log regression: Bash(cat manifest.json) was converted to Read(manifest.json),
+  // then suppressRepeatedReadToolCalls dropped it (already read), leaving NO
+  // tool_use -> empty retry loop. Fix: do not convert if already read.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_bash_cat',
+      name: 'Bash',
+      input: { command: 'cat manifest.json' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ],
+    messages: [
+      { role: 'user', content: 'analyze' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'prev_read', name: 'Read', input: { file_path: 'manifest.json' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'prev_read', content: '{}' }] }
+    ]
+  });
+
+  const toolUses = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUses.length, 1);
+  assert.equal(toolUses[0].name, 'Bash', 'Bash preserved when target already read');
+});
+
+test('canonicalize Bash(cat X) still converts to Read when X is new', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_bash_cat',
+      name: 'Bash',
+      input: { command: 'cat new-file.txt' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolUses = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUses.length, 1);
+  assert.equal(toolUses[0].name, 'Read', 'new target converts Bash to Read');
+  assert.equal(toolUses[0].input.file_path, 'new-file.txt');
+});
+
+test('normalizePathForTool strips trailing XML close tag artifact from file_path', () => {
+  // Real log: model emitted Read with file_path='manifest.json</Read>'.
+  // Trailing </Read> artifact must be stripped to prevent "file not found".
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_x',
+      name: 'Read',
+      input: { file_path: 'manifest.json</Read>' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolUses = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUses.length, 1);
+  assert.equal(toolUses[0].input.file_path, 'manifest.json', 'trailing </Read> stripped');
+});
+
+test('suppressRepeatedReadToolCalls keeps at least one Read when all would be dropped (no empty turn)', () => {
+  // If every Read in the turn targets an already-read file, dropping all
+  // leaves zero tool_use -> empty retry loop. Keep the first original Read
+  // so the session progresses instead of stalling.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_repeat',
+      name: 'Read',
+      input: { file_path: 'manifest.json' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ],
+    messages: [
+      { role: 'user', content: 'analyze' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'prev_read', name: 'Read', input: { file_path: 'manifest.json' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'prev_read', content: '{}' }] }
+    ]
+  });
+
+  const toolUses = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUses.length, 1, 'at least one tool_use preserved to avoid empty turn');
 });
 
 test('enforceWriteFromFencedContent: synthesizes Write when model emits markdown fenced + Bash but forgets Write', () => {
