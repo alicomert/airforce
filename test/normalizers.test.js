@@ -3250,6 +3250,77 @@ test('drops Read with XML tag as file_path (hallucinated instrumentation leak)',
   assert.equal(toolBlocks.length, 0, 'Read with XML tag in path should be dropped');
 });
 
+test('applyOpenAiChatNormalization drops read({}) with empty args (OpenCode broken tool call)', () => {
+  // Real log regression: OpenCode + glm-5 produced 6x read({}) broken tool
+  // calls. Zod validator rejected all with 'expected string on filePath'.
+  // Turn was wasted, model retried, session stalled. dropEmptyBrokenToolCalls
+  // was previously only applied on Anthropic path; now works on OpenAI chat too.
+  const payload = applyOpenAiChatNormalization({
+    choices: [{
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: 'Let me investigate.',
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'read', arguments: '{}' } },
+          { id: 'c2', type: 'function', function: { name: 'read', arguments: '{}' } },
+          { id: 'c3', type: 'function', function: { name: 'read', arguments: '{}' } }
+        ]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: { filePath: { type: 'string' } },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  const choice = payload.choices[0];
+  // All 3 broken reads dropped, fallback to stop
+  assert.equal(choice.finish_reason, 'stop', 'empty tool_calls -> stop');
+  assert.ok(!choice.message.tool_calls || choice.message.tool_calls.length === 0);
+});
+
+test('applyOpenAiChatNormalization keeps valid read with filePath', () => {
+  const payload = applyOpenAiChatNormalization({
+    choices: [{
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'read', arguments: '{"filePath":"package.json"}' } }
+        ]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: { filePath: { type: 'string' } },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  const choice = payload.choices[0];
+  assert.equal(choice.finish_reason, 'tool_calls');
+  assert.equal(choice.message.tool_calls.length, 1);
+  const args = JSON.parse(choice.message.tool_calls[0].function.arguments);
+  assert.equal(args.filePath, 'package.json');
+});
+
 test('fillSchemaRequiredDefaults: Bash with OpenCode schema gets timeout auto-filled', () => {
   // Real log regression: OpenCode client declares bash schema with timeout
   // (number) as required. Weak models (glm-5) don't provide it, client
