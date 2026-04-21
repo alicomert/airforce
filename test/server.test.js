@@ -54,20 +54,39 @@ test('isNoProgressAssistantTurn: real tool_use response is never retryable', () 
   }), false);
 });
 
-test('isNoProgressAssistantTurn: mid-session text summary after prior tool_use is NOT retryable', () => {
-  // Model already did work (prior tool_use in history); this turn is a
-  // legitimate summary/answer. Text-only reply is fine here, do not retry.
+test('isNoProgressAssistantTurn: mid-session text after exploration-only history IS retryable', () => {
+  // Session has only exploration tool_use (Read), no mutation (Write/Edit).
+  // Model returning text-only here means exploration ended without producing
+  // the requested change -> retry to push for mutation.
   assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
-    content: [{ type: 'text', text: 'Here is the summary of the project.' }],
+    content: [{ type: 'text', text: 'Let me try a different approach:' }],
     stop_reason: 'end_turn'
   }, {
     messages: [
-      { role: 'user', content: 'analyze' },
+      { role: 'user', content: 'create CLAUDE.md' },
       {
         role: 'assistant',
         content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }]
       },
       { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] }
+    ]
+  }), true);
+});
+
+test('isNoProgressAssistantTurn: text after MUTATION (Write) is NOT retryable (work is done)', () => {
+  // Model wrote file, tool_result came back, now model gives summary text.
+  // This is legitimate completion - do not retry.
+  assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
+    content: [{ type: 'text', text: 'Done! Created the file.' }],
+    stop_reason: 'end_turn'
+  }, {
+    messages: [
+      { role: 'user', content: 'create CLAUDE.md' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'Write', input: { file_path: 'CLAUDE.md', content: '# hi' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] }
     ]
   }), false);
 });

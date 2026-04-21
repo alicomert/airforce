@@ -254,25 +254,51 @@ export function isNoProgressAssistantTurn(pathname, payload, requestBody) {
   if (textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE)) {
     return true;
   }
-  // Session ilk turde mi? (Prior assistant tool_use YOK mu?)
   // Requestbody yoksa risk alma, legit kabul et (geriye donuk uyumluluk).
   if (!requestBody || !Array.isArray(requestBody.messages)) {
     return false;
   }
+
+  // Prior history analizi (yapisal sinyal toplama).
   let priorToolUseCount = 0;
   let userMessageCount = 0;
+  let lastAssistantToolCategory = null;
   for (const msg of requestBody.messages) {
     if (msg?.role === 'user') userMessageCount += 1;
     if (msg?.role !== 'assistant' || !Array.isArray(msg?.content)) continue;
     for (const block of msg.content) {
-      if (block?.type === 'tool_use') priorToolUseCount += 1;
+      if (block?.type !== 'tool_use') continue;
+      priorToolUseCount += 1;
+      const normalized = String(block?.name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (/^(write|writefile|createfile|edit|editfile|strreplace|multiedit|delete|deletefile|rm|remove)/.test(normalized)) {
+        lastAssistantToolCategory = 'mutation';
+      } else if (/^(read|readfile|glob|grep|listdirectory|search|bash|shell|exec|powershell)/.test(normalized)) {
+        lastAssistantToolCategory = 'exploration';
+      } else {
+        lastAssistantToolCategory = 'other';
+      }
     }
   }
-  // Session'da hic tool_use olmamis + kullanici bir mesaj gondermis:
-  // model sadece text dondu (is yok). Retry tetikle.
+
+  // Case 3: Session ilk turde, hic tool_use yok, model sadece text.
   if (priorToolUseCount === 0 && userMessageCount >= 1) {
     return true;
   }
+
+  // Case 4: Session ortasinda, son tool MUTATION degildi (yani model hala
+  // kesif fazindaydi) ve model simdi text-only dondu. Is yarim kaldi:
+  // exploration bitmis gibi gorunuyor ama hic Write/Edit gelmedi. Retry.
+  //
+  // Karşı sinyal: eger son tool MUTATION idi (Write/Edit/Delete basarili),
+  // text cevap legitimate "bittigini ozetliyor" olabilir - DOKUNMA.
+  if (priorToolUseCount > 0 && lastAssistantToolCategory === 'exploration') {
+    // Kullanicinin en son user mesajinda bir is istegi var mi kontrolu yok
+    // (dile bagimli olur). Yapisal kural: exploration sonrasi text-only
+    // cevap + end_turn ve ikinci/ucuncu user talebi yok ise MUTATION
+    // eksik, retry et.
+    return true;
+  }
+
   return false;
 }
 
