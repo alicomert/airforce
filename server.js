@@ -37,9 +37,11 @@ const FAST_MODE = process.env.FAST_MODE !== '0';
 const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || (FAST_MODE ? 3 : 4)));
 const UPSTREAM_RETRY_BASE_MS = Math.max(50, Number(process.env.UPSTREAM_RETRY_BASE_MS || (FAST_MODE ? 150 : 300)));
 const UPSTREAM_RETRY_MAX_MS = Math.max(200, Number(process.env.UPSTREAM_RETRY_MAX_MS || (FAST_MODE ? 1500 : 3000)));
-// Tek bir upstream isteginin max suresi (ms). Default 2 dakika (FAST_MODE)
-// veya 3 dakika (normal). Modeller artik daha hizli, 3dk fazla.
-const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || (FAST_MODE ? 120000 : 180000)));
+// Tek bir upstream isteginin max suresi (ms). Default 3 dakika.
+// Buyuk dosya Read + model generation + uzun content tek turda 2 dakikayi
+// asabiliyor (100KB+ dosya analizinde real-world timeout gorulmustu).
+// 180s hem FAST_MODE'da hem de normal mode'da artik guvenli default.
+const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || 180000));
 // Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
 // Her retry'da upstream prompt'una daha direkt bir nudge eklenir; conversation
 // state (messages history) DEGISMEZ, sadece request body icindeki system
