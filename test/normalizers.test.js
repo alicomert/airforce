@@ -20,6 +20,7 @@ I'll read files.
   assert.equal(parsed.toolCalls[0].input.path, 'C:\\demo\\AGENTS.md');
 });
 
+
 test('extractPseudoToolCalls parses official <tool_use> tags', () => {
   const sample = `<think>internal<[PLHD36_never_used_51bce0c785ca2f68081bfa7d91973934]>
 I'll read files.
