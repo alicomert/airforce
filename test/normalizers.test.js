@@ -3150,6 +3150,76 @@ test('strips <thinking> chain-of-thought tag like <think>', () => {
   assert.ok(textBlock.text.includes('Here is my answer.'), 'real answer preserved');
 });
 
+test('model returns only text on first turn -> proxy synthesizes Glob fallback (no stall)', () => {
+  // Critical regression: user asked anything, model returned just text
+  // "I'll start by exploring..." with stop_reason: end_turn, no tool_use.
+  // Proxy must NOT let this stall. Language-agnostic: any user text + no
+  // tool_use + no prior tools -> fallback Glob.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: "I'll start by exploring the codebase structure to understand the project."
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'projeyi analiz et' } // Turkish, no slash-command
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1, 'language-agnostic fallback should work for any user text');
+  assert.equal(toolBlocks[0].name, 'Glob');
+  assert.equal(toolBlocks[0].input.pattern, '**/*');
+});
+
+test('instrumentation-only user text (tags stripped) -> no false triggering by embedded filenames', () => {
+  // User text is entirely <system-reminder> tags (common in Claude Code).
+  // Those contain tool manifests mentioning files like 'settings.local.json'.
+  // Must NOT block Glob synthesis: stripInstrumentationTags removes them
+  // before extractFilenameFromText check.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: "I'll start by exploring."
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      {
+        role: 'user',
+        content: '<system-reminder>Skills include: settings.local.json config.json</system-reminder>\n<command-name>/init</command-name>\n<command-message>in</command-message>'
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1, 'instrumentation filenames should not block fallback');
+  assert.equal(toolBlocks[0].name, 'Glob');
+});
+
 test('/init wrapped in <command-name> XML tag still triggers Glob synthesis', () => {
   // Real log regression: Claude Code wraps /init as <command-name>/init</command-name>.
   // Old regex required whitespace before `/`, so `>/init` did not match and
