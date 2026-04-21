@@ -31,19 +31,49 @@ test('shouldHandleSyntheticStream enables anthropic-compatible streaming for /v1
   assert.equal(shouldHandleSyntheticStream('/v1/models', { stream: true }), false);
 });
 
-test('isNoProgressAssistantTurn treats stalling anthropic text as retryable no-progress', () => {
+test('isNoProgressAssistantTurn: text-only first-turn reply with no prior tool_use is retryable (structural)', () => {
+  // User sent message, model returned only text and no tool_use, no prior
+  // assistant tool_use in history. This is "model said words, did no work".
   assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
-    content: [{ type: 'text', text: 'Let me explore the full codebase to create a proper CLAUDE.md.' }],
+    content: [{ type: 'text', text: 'I will start by exploring the codebase.' }],
     stop_reason: 'end_turn'
+  }, {
+    messages: [{ role: 'user', content: 'analyze this project' }]
   }), true);
 });
 
-test('isNoProgressAssistantTurn keeps real tool_use responses non-retryable', () => {
+test('isNoProgressAssistantTurn: real tool_use response is never retryable', () => {
   assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
     content: [
-      { type: 'text', text: 'Let me explore the codebase properly.' },
+      { type: 'text', text: 'Exploring now.' },
       { type: 'tool_use', name: 'Glob', input: { pattern: '**/*' } }
     ],
     stop_reason: 'tool_use'
+  }, {
+    messages: [{ role: 'user', content: 'analyze' }]
   }), false);
+});
+
+test('isNoProgressAssistantTurn: mid-session text summary after prior tool_use is NOT retryable', () => {
+  // Model already did work (prior tool_use in history); this turn is a
+  // legitimate summary/answer. Text-only reply is fine here, do not retry.
+  assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
+    content: [{ type: 'text', text: 'Here is the summary of the project.' }],
+    stop_reason: 'end_turn'
+  }, {
+    messages: [
+      { role: 'user', content: 'analyze' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] }
+    ]
+  }), false);
+});
+
+test('isNoProgressAssistantTurn: completely empty payload is retryable', () => {
+  assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
+    content: []
+  }, { messages: [{ role: 'user', content: 'hi' }] }), true);
 });

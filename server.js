@@ -204,14 +204,28 @@ function isEffectivelyEmpty(pathname, payload) {
   return false;
 }
 
-// "No progress" turu tespiti (dil-bagimsiz, deterministik):
-//   - Tool_use yok, thinking yok
-//   - Text ya tamamen bos ya da proxy'nin kendi "empty response" mesaji
-// Onceki versiyonu modelin "Let me check" / "bakiyorum" gibi cumlelerini
-// yakalayip retry tetikliyordu. Bu dile bagli, ayrica gereksiz yere yavaslik
-// yaratiyordu (gecerli end_turn cevaplarinda bile retry ediyordu).
-// Artik sadece gerekten bos/proxy-fallback response'larda retry tetikleyecegiz.
-export function isNoProgressAssistantTurn(pathname, payload) {
+// "No progress" turu tespiti (dil-bagimsiz, deterministik, yapisal).
+//
+// Bu fonksiyon retry'i tetikler. Kurallar:
+//
+//   TRUE don eger:
+//     - Payload tamamen bos (ne text ne tool_use)
+//     - Sadece proxy'nin kendi empty-fallback mesaji var
+//     - **YENI**: Session'in ilk turunde (hic prior tool_use yok),
+//       kullanici bir talep gonderdi (mesaji bos degil) ama model SADECE
+//       text dondu + tool_use YOK. Bu "is yapmadi, sadece laf etti"
+//       durumudur. Kullanici "exploreliyorum" kisvesinde bir cevap gormek
+//       istemez, aksiyon ister. Nudge ile retry tetikle.
+//
+//   FALSE don (legitimate, retry YOK):
+//     - Payload'da tool_use var (model is yapti)
+//     - Payload'da thinking var (model dusunuyor, geride tool_use gelecek)
+//     - Session'da prior tool_use VAR (bu bir ara tur veya ozet tur, model
+//       iste ilerliyor, text cevabi mesru olabilir)
+//
+// Dile bagimli kelime regex'i YOK. Sadece yapisal sinyaller: tool_use var mi,
+// thinking var mi, prior history'de tool kullanildi mi.
+export function isNoProgressAssistantTurn(pathname, payload, requestBody) {
   if (!payload || typeof payload !== 'object') {
     return true;
   }
@@ -236,9 +250,30 @@ export function isNoProgressAssistantTurn(pathname, payload) {
   if (textBlocks.length === 0) {
     return true;
   }
-  // Sadece proxy'nin kendi empty-response fallback mesajini no-progress say.
-  // Diger text icerigi (meshru assistant cevabi) retry TETIKLEMEZ artik.
-  return textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE);
+  // Proxy'nin kendi fallback mesaji -> kesinlikle no-progress
+  if (textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE)) {
+    return true;
+  }
+  // Session ilk turde mi? (Prior assistant tool_use YOK mu?)
+  // Requestbody yoksa risk alma, legit kabul et (geriye donuk uyumluluk).
+  if (!requestBody || !Array.isArray(requestBody.messages)) {
+    return false;
+  }
+  let priorToolUseCount = 0;
+  let userMessageCount = 0;
+  for (const msg of requestBody.messages) {
+    if (msg?.role === 'user') userMessageCount += 1;
+    if (msg?.role !== 'assistant' || !Array.isArray(msg?.content)) continue;
+    for (const block of msg.content) {
+      if (block?.type === 'tool_use') priorToolUseCount += 1;
+    }
+  }
+  // Session'da hic tool_use olmamis + kullanici bir mesaj gondermis:
+  // model sadece text dondu (is yok). Retry tetikle.
+  if (priorToolUseCount === 0 && userMessageCount >= 1) {
+    return true;
+  }
+  return false;
 }
 
 // Model bos cevap atmis ve retry'lar da bosa cikmissa, sessizce bos
@@ -560,7 +595,7 @@ const server = http.createServer(async (req, res) => {
       payload = restorePresentedModel(parsedBody, payload);
 
       const effectivelyEmpty = isEffectivelyEmpty(requestUrl.pathname, payload);
-      const noProgress = isNoProgressAssistantTurn(requestUrl.pathname, payload);
+      const noProgress = isNoProgressAssistantTurn(requestUrl.pathname, payload, parsedBody);
       lastWasEmpty = noProgress;
 
       // Basarili response + effectively empty → nudge'li yeniden cagri
