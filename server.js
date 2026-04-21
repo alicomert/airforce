@@ -23,21 +23,28 @@ const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || 'https://api.airforc
 const DEFAULT_API_KEY = process.env.AIRFORCE_API_KEY || '';
 const MODEL_ALIASES = parseAliases(process.env.MODEL_ALIASES);
 const DEBUG_LOGS = process.env.DEBUG_LOGS !== '0';
+// FAST_MODE=1: kullanici "sistem yavas" dedi; default degerleri sikistirilmis
+// versiyona getir. Her biri env ile tekil override edilebilir.
+const FAST_MODE = process.env.FAST_MODE !== '0';
+
 // Upstream retry config. Network/5xx/408/425/429 icin exponential backoff.
-// Default degerler: hizli ama agresif olmayan. Uzun sureler (kullanicinin
-// "6 dakika bekledim" sikayetleri) icin pratik secimler:
-//   - Attempt sayisi: 4 (3 retry + orjinal deneme). 6 fazla idi.
-//   - Base delay: 300ms. 500 fazla idi.
-//   - Max delay: 3 saniye. 8 saniye asiridir.
-const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || 4));
-const UPSTREAM_RETRY_BASE_MS = Math.max(100, Number(process.env.UPSTREAM_RETRY_BASE_MS || 300));
-const UPSTREAM_RETRY_MAX_MS = Math.max(500, Number(process.env.UPSTREAM_RETRY_MAX_MS || 3000));
-// Tek bir upstream isteginin max suresi (ms). Uzun modeller icin rahat olsun diye 3dk default.
-const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || 180000));
+// FAST_MODE defaults (hizli ama hala resilient):
+//   - Attempt sayisi: 3 (2 retry + orjinal). 4 uzundu.
+//   - Base delay: 150ms. 300 yavas kaliyordu.
+//   - Max delay: 1.5s. 3s cok uzun.
+// Normal mode defaults (eski deger):
+//   - 4 attempt, 300ms base, 3s max
+const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || (FAST_MODE ? 3 : 4)));
+const UPSTREAM_RETRY_BASE_MS = Math.max(50, Number(process.env.UPSTREAM_RETRY_BASE_MS || (FAST_MODE ? 150 : 300)));
+const UPSTREAM_RETRY_MAX_MS = Math.max(200, Number(process.env.UPSTREAM_RETRY_MAX_MS || (FAST_MODE ? 1500 : 3000)));
+// Tek bir upstream isteginin max suresi (ms). Default 2 dakika (FAST_MODE)
+// veya 3 dakika (normal). Modeller artik daha hizli, 3dk fazla.
+const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || (FAST_MODE ? 120000 : 180000)));
 // Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
-// Default: 1 retry (asil + 1 tekrar). 3 retry * backoff cok uzun surelere yol aciyor.
+// FAST_MODE: 1 retry (default). Yeni normalizer empty response'u cok azaltti.
+// Normal: 3 retry.
 const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
-const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 3));
+const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || (FAST_MODE ? 1 : 3)));
 
 function parseAliases(raw) {
   if (!raw) {
@@ -188,8 +195,13 @@ function isEffectivelyEmpty(pathname, payload) {
   return false;
 }
 
-const NO_PROGRESS_TEXT_RE = /\b(let me (?:first |just |quickly )?(?:check|see|look|explore|analy[sz]e|examine|understand|read|review|inspect)|i(?:'|’)ll (?:first |now |start|begin)?\s*(?:check|look|explore|analy[sz]e|examine|understand|read|review|inspect)|going to (?:check|look|explore|analy[sz]e|examine|understand|read|review|inspect)|exploring the codebase|checking the repository|reading the files|let me explore the full codebase|let me explore the codebase properly)\b/i;
-
+// "No progress" turu tespiti (dil-bagimsiz, deterministik):
+//   - Tool_use yok, thinking yok
+//   - Text ya tamamen bos ya da proxy'nin kendi "empty response" mesaji
+// Onceki versiyonu modelin "Let me check" / "bakiyorum" gibi cumlelerini
+// yakalayip retry tetikliyordu. Bu dile bagli, ayrica gereksiz yere yavaslik
+// yaratiyordu (gecerli end_turn cevaplarinda bile retry ediyordu).
+// Artik sadece gerekten bos/proxy-fallback response'larda retry tetikleyecegiz.
 export function isNoProgressAssistantTurn(pathname, payload) {
   if (!payload || typeof payload !== 'object') {
     return true;
@@ -215,10 +227,9 @@ export function isNoProgressAssistantTurn(pathname, payload) {
   if (textBlocks.length === 0) {
     return true;
   }
-  if (textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE)) {
-    return true;
-  }
-  return textBlocks.every((text) => NO_PROGRESS_TEXT_RE.test(text));
+  // Sadece proxy'nin kendi empty-response fallback mesajini no-progress say.
+  // Diger text icerigi (meshru assistant cevabi) retry TETIKLEMEZ artik.
+  return textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE);
 }
 
 // Model bos cevap atmis ve retry'lar da bosa cikmissa, sessizce bos
@@ -582,8 +593,15 @@ const server = http.createServer(async (req, res) => {
 const isMainModule = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 
 if (isMainModule) {
+  // TCP keep-alive: istemcinin (Claude Code, OpenCode) ardisik request'lerinde
+  // bagaltinin yeniden acilmasini onler (TLS handshake + TCP SYN latency kazanci).
+  // Default 5s idle, biz 30s'ye cikaralim - ardisik tool_use turlarinda istemci
+  // genelde 1-2s icinde geri sorar, o pencerede bagaltimi tut.
+  server.keepAliveTimeout = 30_000;
+  server.headersTimeout = 35_000; // keepAlive + 5s buffer
   server.listen(PORT, HOST, () => {
     console.log(`Airforce compat proxy listening on http://${HOST}:${PORT}`);
     console.log(`Upstream: ${UPSTREAM_BASE_URL}`);
+    console.log(`FAST_MODE: ${FAST_MODE ? 'on' : 'off'} | attempts=${UPSTREAM_MAX_ATTEMPTS} empty_retries=${EMPTY_RESPONSE_MAX_RETRIES} timeout=${UPSTREAM_TIMEOUT_MS}ms`);
   });
 }

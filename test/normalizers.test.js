@@ -2761,6 +2761,200 @@ test('cleans consecutive tool_use> stray text that weak models emit', () => {
 // Bu yuzden testler Cince, Almanca, emoji gibi farkli dillerde de ayni
 // sonuclari vermeli.
 
+test('Bash(cat X) is rewritten to Read(X) to avoid stdout overflow on large files', () => {
+  // Real log regression: model calls Bash(cat index.html) on a big HTML file.
+  // cat dumps everything to stdout; Claude Code's bash tool_result truncates
+  // or fails. Proxy should rewrite this to the client's Read tool which has
+  // offset/limit support.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_cat',
+      name: 'Bash',
+      input: { command: 'cat index.html' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolBlock);
+  assert.equal(toolBlock.name, 'Read', 'cat should be rewritten to Read');
+  assert.equal(toolBlock.input.file_path, 'index.html');
+});
+
+test('Bash(head -50 X) also rewritten to Read (head is a read-like cmd)', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_head',
+      name: 'Bash',
+      input: { command: 'head -50 package.json' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolBlock);
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'package.json');
+});
+
+test('Bash with leading stray prefix "_ cat X" is cleaned to "cat X" then Read', () => {
+  // Real log: model emitted "_ cat index.html" - the leading "_" would make
+  // bash return "_: command not found". Proxy strips stray prefix chars AND
+  // then detects cat -> rewrites to Read.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_stray',
+      name: 'Bash',
+      input: { command: '_ cat index.html' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolBlock);
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'index.html');
+});
+
+test('Bash with parenthesized cat like "(cat x)" is unwrapped and rewritten to Read', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_paren',
+      name: 'Bash',
+      input: { command: '(cat index.html)' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolBlock);
+  assert.equal(toolBlock.name, 'Read');
+  assert.equal(toolBlock.input.file_path, 'index.html');
+});
+
+test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => {
+  // Guard: only simple read-like commands are rewritten. Compound ones with
+  // pipes/redirects run as-is (proxy doesn't understand their intent).
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_pipe',
+      name: 'Bash',
+      input: { command: 'cat index.html | head -20' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolBlock);
+  assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
+});
+
+test('strips <details> block containing only narration (no code, no list)', () => {
+  // Real log: weak model writes self-narration inside <details><summary>...
+  // Claude Code renders that literally. Proxy should strip it since there's
+  // no real content (code/table/list/link) inside.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<details>\n<summary>Continue exploring...</summary>\n\nLet me read the key files to understand what this project is.\n\n</details>\nSome real text after.'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(!textBlock.text.includes('<details>'), '<details> narration block should be stripped');
+  assert.ok(!textBlock.text.includes('<summary>'), '<summary> should be gone too');
+  assert.ok(textBlock.text.includes('Some real text after.'), 'surrounding legitimate text preserved');
+});
+
+test('preserves <details> block that contains real content (code or list)', () => {
+  // Positive: <details> with a code block inside is legitimate UI content,
+  // should NOT be stripped.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<details>\n<summary>Example</summary>\n\n```js\nconst x = 1;\n```\n\n</details>'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(textBlock.text.includes('<details>'), '<details> with code should be preserved');
+  assert.ok(textBlock.text.includes('```js'), 'code block inside preserved');
+});
+
+test('strips <thinking> chain-of-thought tag like <think>', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<thinking>\nLet me analyze this step by step.\n</thinking>\nHere is my answer.'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(!textBlock.text.includes('<thinking>'), '<thinking> should be stripped');
+  assert.ok(!textBlock.text.includes('step by step'), 'chain-of-thought content should be hidden');
+  assert.ok(textBlock.text.includes('Here is my answer.'), 'real answer preserved');
+});
+
 test('/init wrapped in <command-name> XML tag still triggers Glob synthesis', () => {
   // Real log regression: Claude Code wraps /init as <command-name>/init</command-name>.
   // Old regex required whitespace before `/`, so `>/init` did not match and
