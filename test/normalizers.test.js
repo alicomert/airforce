@@ -2761,6 +2761,201 @@ test('cleans consecutive tool_use> stray text that weak models emit', () => {
 // Bu yuzden testler Cince, Almanca, emoji gibi farkli dillerde de ayni
 // sonuclari vermeli.
 
+test('drops Write when content heading references DIFFERENT file (prevents overwriting wrong file)', () => {
+  // Real log regression: model emitted Write(manifest.json, '# CLAUDE.md\n...').
+  // This would overwrite manifest.json with CLAUDE.md content -> catastrophic.
+  // Content first-line heading filename mismatches path.basename -> DROP.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_mismatch',
+      name: 'Write',
+      input: {
+        file_path: 'manifest.json',
+        content: '# CLAUDE.md\n\nThis file provides guidance to Claude Code.'
+      }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [{ role: 'user', content: 'create CLAUDE.md' }]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'Write with content heading for different file must be dropped');
+});
+
+test('keeps Write when content heading matches path basename (legitimate)', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_ok',
+      name: 'Write',
+      input: {
+        file_path: 'CLAUDE.md',
+        content: '# CLAUDE.md\n\nThis file provides guidance.'
+      }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 1, 'matching filename in heading should pass');
+});
+
+test('keeps Write when content has no filename heading (common case)', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_no_heading',
+      name: 'Write',
+      input: {
+        file_path: 'config.json',
+        content: '{"key":"value"}'
+      }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 1, 'no filename heading in content -> no mismatch, pass');
+});
+
+test('drops Bash(timeout) alone - missing operand, produces exit 1', () => {
+  // Real log: model emitted Bash(command='timeout'). That produces
+  // "timeout: missing operand" on Linux. Useless call, drop it.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_to',
+      name: 'Bash',
+      input: { command: 'timeout' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 0, 'bare "timeout" command should be dropped');
+});
+
+test('collapses duplicate Glob calls with same pattern in one turn', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 't1', name: 'Glob', input: { pattern: '**/*' } },
+      { type: 'tool_use', id: 't2', name: 'Glob', input: { pattern: '**/*' } },
+      { type: 'tool_use', id: 't3', name: 'Glob', input: { pattern: '**/*' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1, '3 duplicate Glob calls -> 1');
+  assert.equal(toolBlocks[0].input.pattern, '**/*');
+});
+
+test('keeps Glob calls with DIFFERENT patterns in one turn', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 't1', name: 'Glob', input: { pattern: '**/*.md' } },
+      { type: 'tool_use', id: 't2', name: 'Glob', input: { pattern: '**/*.json' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 2, 'different Glob patterns are preserved');
+});
+
+test('strips leaked <content> XML tags from text', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<content>\nLet me read the files.\n</content>\n\nHere is the result.'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(!textBlock.text.includes('<content>'), '<content> open tag stripped');
+  assert.ok(!textBlock.text.includes('</content>'), '</content> close tag stripped');
+  assert.ok(textBlock.text.includes('Let me read the files.'), 'inner text preserved');
+  assert.ok(textBlock.text.includes('Here is the result.'), 'surrounding text preserved');
+});
+
 test('Bash(cat X) is rewritten to Read(X) to avoid stdout overflow on large files', () => {
   // Real log regression: model calls Bash(cat index.html) on a big HTML file.
   // cat dumps everything to stdout; Claude Code's bash tool_result truncates
