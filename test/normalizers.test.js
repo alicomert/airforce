@@ -1729,6 +1729,130 @@ test('intent synthesis: after exploration tool_result, synthesizes Read for key 
   assert.equal(toolBlocks[0].input.file_path, 'AGENTS.md');
 });
 
+test('intent synthesis: generic "read key files" after exploration prefers Read over Glob', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_followup_generic_read_after_glob',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'Let me read the key files to understand the project.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      {
+        name: 'Glob',
+        input_schema: {
+          type: 'object',
+          properties: { pattern: { type: 'string' } },
+          required: ['pattern']
+        }
+      },
+      {
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path']
+        }
+      }
+    ],
+    messages: [
+      { role: 'user', content: 'analyze this repo' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_glob_recent', name: 'Glob', input: { pattern: '**/*' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_glob_recent',
+            content: 'README.md\nAGENTS.md\npackage.json\nserver.js'
+          }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'AGENTS.md');
+});
+
+test('intent synthesis: after one Read, generic follow-up picks next unread key file from prior listing', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_followup_next_unread_after_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: 'It seems the file listing keeps repeating. Let me try to directly read the key files.' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      {
+        name: 'Glob',
+        input_schema: {
+          type: 'object',
+          properties: { pattern: { type: 'string' } },
+          required: ['pattern']
+        }
+      },
+      {
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path']
+        }
+      }
+    ],
+    messages: [
+      { role: 'user', content: 'analyze this repo' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_glob_initial', name: 'Glob', input: { pattern: '**/*' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_glob_initial',
+            content: 'README.md\nAGENTS.md\npackage.json\nserver.js'
+          }
+        ]
+      },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_read_first', name: 'Read', input: { file_path: 'AGENTS.md' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_read_first',
+            content: '# AGENTS\nrepo instructions'
+          }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'README.md');
+});
+
 test('applyAnthropicNormalization suppresses repeated Read loop after prior read tool_result', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg_repeat_read_loop',

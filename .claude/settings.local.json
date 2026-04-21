@@ -10,7 +10,11 @@
       "Bash(nginx -t)",
       "Bash(command -v gh)",
       "Bash(sudo apt *)",
-      "Bash(git init *)"
+      "Bash(git init *)",
+      "Bash(bash *)",
+      "Bash(context *)",
+      "Bash(:message=\"Update intent-synthesis and normalizers test\" *)",
+      "Bash(Bash *)"
     ]
   }
 }
