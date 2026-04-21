@@ -497,11 +497,23 @@ const server = http.createServer(async (req, res) => {
       ? {
           stop_reason: payload?.stop_reason,
           content: Array.isArray(payload?.content)
-            ? payload.content.map((block) => ({
-                type: block?.type,
-                name: block?.name,
-                text: typeof block?.text === 'string' ? block.text.slice(0, 80) : undefined
-              }))
+            ? payload.content.map((block) => {
+                const entry = { type: block?.type };
+                if (block?.name !== undefined) entry.name = block.name;
+                if (typeof block?.text === 'string') entry.text = block.text.slice(0, 120);
+                if (block?.type === 'tool_use' && block?.input && typeof block.input === 'object') {
+                  // Tool_use input'unu kisaltilmis halde goster (debug icin kritik).
+                  entry.input = Object.fromEntries(
+                    Object.entries(block.input).map(([key, value]) => {
+                      if (typeof value === 'string') {
+                        return [key, value.length > 120 ? `${value.slice(0, 120)}...` : value];
+                      }
+                      return [key, value];
+                    })
+                  );
+                }
+                return entry;
+              })
             : []
         }
       : {
@@ -510,7 +522,12 @@ const server = http.createServer(async (req, res) => {
                 finish_reason: choice?.finish_reason,
                 content: typeof choice?.message?.content === 'string' ? choice.message.content.slice(0, 80) : choice?.message?.content,
                 tool_calls: Array.isArray(choice?.message?.tool_calls)
-                  ? choice.message.tool_calls.map((toolCall) => toolCall?.function?.name)
+                  ? choice.message.tool_calls.map((toolCall) => ({
+                      name: toolCall?.function?.name,
+                      arguments: typeof toolCall?.function?.arguments === 'string' && toolCall.function.arguments.length > 200
+                        ? `${toolCall.function.arguments.slice(0, 200)}...`
+                        : toolCall?.function?.arguments
+                    }))
                   : []
               }))
             : []

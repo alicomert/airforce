@@ -2458,6 +2458,77 @@ test('drops bash tool_use with only tool-name as command (context/Bash/:message=
   }
 });
 
+test('suppresses read of file already read in earlier (not just last) turn', () => {
+  // Weak models loop: Read AGENTS.md -> "empty" -> Read AGENTS.md -> "empty" -> ...
+  // Eskiden sadece son assistant turunda kontrol ediliyordu; artik butun gecmis.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_read_again',
+      name: 'Read',
+      input: { file_path: 'AGENTS.md' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }, {
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'explore' },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_read_1',
+          name: 'Read',
+          input: { file_path: 'AGENTS.md' }
+        }]
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_read_1', content: 'content' }]
+      },
+      // Aradaki asistant turu FARKLI bir sey yapiyor
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_glob_1',
+          name: 'Glob',
+          input: { pattern: '**/*' }
+        }]
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_glob_1', content: 'README.md\n' }]
+      }
+    ]
+  });
+
+  // Ayni dosya tekrar okunmaya calisildi (2. Read); drop edilmeli ve intent
+  // synthesis baska bir dosya (README.md) sentezlemeli.
+  const toolUseBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolUseBlocks.length, 1);
+  // Ya tamamen baska bir dosya, ya da bos (en azindan AGENTS.md degil)
+  const readPath = toolUseBlocks[0].input?.file_path ?? toolUseBlocks[0].input?.filePath ?? toolUseBlocks[0].input?.path;
+  assert.notEqual(String(readPath ?? '').toLowerCase(), 'agents.md');
+});
+
 test('intent synthesis picks a file after Glob tool_result when model emits broken Read', () => {
   // Conversation: user -> assistant uses Glob -> tool_result contains AGENTS.md
   // -> assistant emits broken Read with no file_path -> we drop it and
@@ -2518,4 +2589,55 @@ test('intent synthesis picks a file after Glob tool_result when model emits brok
   const readPath = toolUseBlocks[0].input?.file_path ?? toolUseBlocks[0].input?.filePath ?? toolUseBlocks[0].input?.path;
   // AGENTS.md en oncelikli dosya (KEY_FILE_PRIORITY)
   assert.equal(String(readPath).toLowerCase(), 'agents.md');
+});
+
+test('strips command-message client instrumentation tags from bash command', () => {
+  // Claude Code / OpenCode istemcileri <command-message>...</command-message>
+  // gibi tag'leri text'e gomuyor; model bazen bunlari bash komutuna yapistirir.
+  // Eski INSTRUMENTATION_TAG_RE sadece underscore'u yakaliyordu (command_message),
+  // simdi dash'li (command-message) de yakalaniyor.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_bash',
+      name: 'Bash',
+      input: { command: 'ls -la\n<command-message>internal</command-message>' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: {
+        type: 'object',
+        properties: { command: { type: 'string' }, description: { type: 'string' } },
+        required: ['command']
+      }
+    }]
+  });
+
+  const toolBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(toolBlock);
+  assert.equal(toolBlock.input.command, 'ls -la');
+});
+
+test('cleans consecutive tool_use> stray text that weak models emit', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'tool_use>\n\ntool_use>\n\ntool_use>'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  // Text tamamen temizlenmeli, bos content kalmamali (ya bos text ya hic text).
+  const textBlocks = payload.content.filter((b) => b?.type === 'text');
+  for (const block of textBlocks) {
+    assert.ok(!/tool_use>\s*tool_use>/.test(block.text ?? ''), 'consecutive tool_use> tokens should be stripped');
+  }
 });
