@@ -3089,6 +3089,35 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
 });
 
+test('strips pseudo-tool-call notation "tool_use tool=\\"...\\" command=\\"...\\""', () => {
+  // Real log regression: glm-5 emits 'tool_use tool="Bash" command="ls server/">'
+  // as plain text while also emitting a real tool_use block. This is model's
+  // own internal notation, not a legit tool call. Strip structurally.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'tool_use tool="Bash" command="ls server/">\n\ntool_use tool="Read" file_path="types.ts">\nLet me continue.'
+    }, {
+      type: 'tool_use',
+      id: 'toolu_real',
+      name: 'Read',
+      input: { file_path: 'types.ts' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }]
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  if (textBlock) {
+    assert.ok(!textBlock.text.includes('tool_use tool='), 'pseudo-tool-call stripped');
+    assert.ok(textBlock.text.includes('Let me continue.'), 'real text preserved');
+  }
+});
+
 test('strips repeated stray non-HTML close tags like </tool_use_error>', () => {
   // Real log: model emitted '</tool_use_error>\n\n</tool_use_error>\n\n...' x 6
   // as the entire text response. These are stray close tags (no opening pair),
