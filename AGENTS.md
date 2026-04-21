@@ -9,6 +9,7 @@ Compact guide for working in this repo. See `README.md` and `CLAUDE.md` for user
   - `server.js` — HTTP server + routing + upstream retry + keep-alive
   - `lib/normalizers.js` — all the weird tool-call / `<think>` / XML-ish text normalization (~1700 lines; this is the bulk of the logic)
   - `lib/intent-synthesis.js` — when upstream model answers with plain text instead of tool_use blocks, this module synthesizes the right tool_use from the model's intent (write/read/list/etc). Cross-platform, project-agnostic, uses the client's own tool names.
+  - `lib/system-prompt-injection.js` — before the request goes upstream, proxy injects a dynamic "tool usage contract" into the system prompt. The contract is built from the client's own tool list + schemas (no hardcoded tool names, paths, or examples). It tells the model: "you have these tools, MUST call them for actions, do not just describe actions in text." This helps weak models (glm-5, llama-3) actually emit `tool_use` blocks instead of pasting code inline.
   - `lib/sse.js` — synthesizes Anthropic & OpenAI streaming responses from a single non-stream upstream JSON reply
 - Tests: `node:test` under `test/`, fixtures under `testdata/`.
 
