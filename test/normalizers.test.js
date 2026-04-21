@@ -3089,6 +3089,125 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
 });
 
+test('strips "ToolCall inputs: {...}" text-leak lines from model output', () => {
+  // Real log regression: glm-5 and similar weak models emit lines like
+  // 'ToolCall inputs: {"file_path": "./manifest.json"}' as plain text
+  // alongside the legitimate tool_use block. This internal debug string
+  // should not reach the user's UI. Model-agnostic: any '(tool|function)
+  // call (inputs|arguments|params): {...}' pattern is stripped.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'ToolCall inputs: {"file_path": "./manifest.json"}\nReading the file next.'
+    }, {
+      type: 'tool_use',
+      id: 'toolu_x',
+      name: 'Read',
+      input: { file_path: 'manifest.json' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock, 'text block exists');
+  assert.ok(!textBlock.text.includes('ToolCall inputs:'), 'ToolCall dump stripped');
+  assert.ok(textBlock.text.includes('Reading the file next.'), 'real text preserved');
+});
+
+test('strips "Function call:" JSON dump from model output (GPT-style)', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Function call: {"name": "Read", "arguments": {"path": "x"}}\nActual response here.'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(!textBlock.text.includes('Function call:'));
+  assert.ok(textBlock.text.includes('Actual response here.'));
+});
+
+test('strips leading ./ from file_path to prevent Zod validation errors', () => {
+  // Real log regression: model emitted Write(file_path: './CLAUDE.md', ...)
+  // OpenCode's Zod schema rejects leading './' -> "Write failed". Proxy
+  // normalizes to bare basename.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_x',
+      name: 'Write',
+      input: {
+        file_path: './CLAUDE.md',
+        content: '# CLAUDE.md\n\nactual content here with more than fifty characters so mismatch guard skips.'
+      }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }]
+  });
+
+  const writeBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(writeBlock);
+  assert.equal(writeBlock.input.file_path, 'CLAUDE.md', 'leading ./ stripped');
+  assert.equal(writeBlock.input.filePath, 'CLAUDE.md');
+  assert.equal(writeBlock.input.path, 'CLAUDE.md');
+});
+
+test('normalizePathForTool preserves legitimate absolute and relative paths', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_x',
+      name: 'Read',
+      input: { file_path: 'src/index.js' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const readBlock = payload.content.find((b) => b?.type === 'tool_use');
+  assert.ok(readBlock);
+  assert.equal(readBlock.input.file_path, 'src/index.js', 'nested relative path preserved');
+});
+
 test('strips <details> block containing only narration (no code, no list)', () => {
   // Real log: weak model writes self-narration inside <details><summary>...
   // Claude Code renders that literally. Proxy should strip it since there's
