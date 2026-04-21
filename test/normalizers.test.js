@@ -3089,6 +3089,47 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
 });
 
+test('strips repeated stray non-HTML close tags like </tool_use_error>', () => {
+  // Real log: model emitted '</tool_use_error>\n\n</tool_use_error>\n\n...' x 6
+  // as the entire text response. These are stray close tags (no opening pair),
+  // the user should never see them. Model-agnostic: non-HTML close tag +
+  // repeated pattern = chain-of-thought artifact, strip.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '</tool_use_error>\n\n</tool_use_error>\n\n</tool_use_error>\n\n</tool_use_error>\n\n</tool_use_error>\n\n for the file'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  if (textBlock) {
+    assert.ok(!textBlock.text.includes('</tool_use_error>'), 'stray close tags stripped');
+    assert.ok(textBlock.text.includes('for the file'), 'legitimate trailing text preserved');
+  }
+});
+
+test('preserves stray </div> close tag (legit HTML)', () => {
+  // Counter-test: HTML tags in whitelist are not stray even if unpaired.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Fragment: hello</div> end.'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(textBlock.text.includes('</div>'), 'HTML close tag preserved');
+});
+
 test('drops Bash with capitalized single-word like "Error" / "Result" (hallucinated non-command)', () => {
   // Real log: glm-5 emitted Bash(command='Error'). This is a hallucinated
   // capitalized noun, not a shell command. bash returns "Error: command not
