@@ -189,7 +189,7 @@ function isEffectivelyEmpty(pathname, payload) {
 // response'u donmek yerine kullaniciya problem hakkinda kisa bir aciklama
 // dondur. Boylece Claude Code / OpenCode gibi istemciler asili kalmaz,
 // kullanici ne olduysa gorur ve tekrar dener / model degistirir.
-const EMPTY_RESPONSE_USER_MESSAGE = 'The upstream model returned an empty response. This sometimes happens with weaker models when a request is ambiguous, too long, or references an unknown topic. Try rephrasing the request, breaking it into smaller steps, or switching to a different model.';
+const EMPTY_RESPONSE_USER_MESSAGE = 'The upstream model returned an empty response. Please rephrase the request or try a different model.';
 
 function injectEmptyResponseFallback(pathname, payload) {
   if (!payload || typeof payload !== 'object') {

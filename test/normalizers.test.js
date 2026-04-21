@@ -1571,3 +1571,360 @@ test('intent synthesis: disabled via SYNTHESIZE_INTENT=0', () => {
   assert.equal(payload.stop_reason, 'end_turn');
   assert.equal(payload.content.filter((b) => b.type === 'tool_use').length, 0);
 });
+
+// ---- Claude Code instrumentation tag leakage fixes ----
+
+test('sanitizeCommand strips <command_message> block that leaks into bash command', () => {
+  // Real log: upstream model leaked <command_message> into bash command:
+  //   "find . -type f | head -80\n<command_message>find . -type f | head -80"
+  // bash syntax / unknown-command fail here.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_command_message_leak',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_leak1',
+      name: 'Bash',
+      input: { command: 'find . -type f | head -80\n<command_message>find . -type f | head -80' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] }
+    }]
+  });
+
+  const block = payload.content.find((b) => b.type === 'tool_use');
+  assert.ok(block, 'tool_use block expected');
+  assert.doesNotMatch(block.input.command, /<command_message>/i);
+  assert.doesNotMatch(block.input.command, /<\/command_message>/i);
+  assert.match(block.input.command, /find \. -type f \| head -80/);
+});
+
+test('sanitizeCommand strips leading single dash from bash command (-find -> find)', () => {
+  // Upstream model sometimes starts command with '-find'. bash rejects:
+  //   '/bin/bash: eval: -f: invalid option'
+  const payload = applyAnthropicNormalization({
+    id: 'msg_leading_dash',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_dash',
+      name: 'Bash',
+      input: { command: '-find . -type f | head -80' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] }
+    }]
+  });
+
+  const block = payload.content.find((b) => b.type === 'tool_use');
+  assert.equal(block.input.command, 'find . -type f | head -80');
+});
+
+test('sanitizeCommand preserves legitimate dash flags and double-dash options', () => {
+  // Leading-dash fix must stay conservative: -c, --help should be preserved.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_preserve_flags',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 't1', name: 'Bash', input: { command: '--help' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Bash',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] }
+    }]
+  });
+
+  const blocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].input.command, '--help');
+});
+
+test('Read tool_use with trailing XML artifact in file_path is sanitized', () => {
+  // Real log: Read(index.html</Read-Ray>) - Claude Code instrumentation tag
+  // leaked into the path. Tool input path fields must be sanitized too.
+  const payload = applyAnthropicNormalization({
+    id: 'msg_read_path_xml',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_read_xml',
+      name: 'Read',
+      input: { file_path: 'index.html</Read-Ray>' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] }
+    }]
+  });
+
+  const block = payload.content.find((b) => b.type === 'tool_use');
+  assert.equal(block.input.file_path, 'index.html');
+});
+
+test('Write tool_use with trailing XML artifact in file_path is sanitized', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_write_path_xml',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_write_xml',
+      name: 'Write',
+      input: { file_path: 'output.md</Write-Block>', content: 'hello' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }]
+  });
+
+  const block = payload.content.find((b) => b.type === 'tool_use');
+  assert.equal(block.input.file_path, 'output.md');
+  assert.equal(block.input.content, 'hello');
+});
+
+test('Glob tool_use with system-reminder tag in pattern is sanitized', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_glob_reminder',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_glob_tag',
+      name: 'Glob',
+      input: { pattern: '**/*<system-reminder>context changed</system-reminder>' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] }
+    }]
+  });
+
+  const block = payload.content.find((b) => b.type === 'tool_use');
+  assert.equal(block.input.pattern, '**/*');
+});
+
+// ---- OpenAI structured tool_calls schema fix (OpenCode Zod compatibility) ----
+
+test('applyOpenAiChatNormalization fills filePath when upstream sent only file_path (OpenCode schema)', () => {
+  // Real log from OpenCode + glm-5: upstream gonderdi arguments='{"file_path":"AGENTS.md"}'
+  // ama OpenCode Zod validator 'filePath' (camelCase) bekliyor, required field.
+  // Sonuc: 'Invalid input: expected string, received undefined' hatasi ve sonsuz
+  // loop. Proxy structured tool_calls'i canonicalize etmeli - istemcinin schema
+  // 'property' listesine gore dogru alan(lar)i doldurmali.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chat_1',
+    choices: [{
+      index: 0,
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_abc',
+          type: 'function',
+          function: {
+            name: 'read',
+            arguments: '{"file_path":"AGENTS.md"}'
+          }
+        }]
+      }
+    }]
+  }, {
+    // OpenCode schema: filePath camelCase, required
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: { filePath: { type: 'string' } },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  const tc = payload.choices[0].message.tool_calls[0];
+  assert.equal(tc.function.name, 'read');
+  const args = JSON.parse(tc.function.arguments);
+  assert.equal(args.filePath, 'AGENTS.md');
+});
+
+test('applyOpenAiChatNormalization fills file_path when upstream sent only filePath (Anthropic-style schema)', () => {
+  // Ters durum: upstream filePath yazdi, istemci file_path bekliyor.
+  // canonicalizeToolCalls her iki field'i da doldurur.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chat_2',
+    choices: [{
+      index: 0,
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_xyz',
+          type: 'function',
+          function: {
+            name: 'read',
+            arguments: '{"filePath":"server.js"}'
+          }
+        }]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path']
+        }
+      }
+    }]
+  });
+
+  const tc = payload.choices[0].message.tool_calls[0];
+  const args = JSON.parse(tc.function.arguments);
+  assert.equal(args.file_path, 'server.js');
+});
+
+test('applyOpenAiChatNormalization sanitizes XML artifact in structured tool_call path argument', () => {
+  // Claude Code instrumentation tag'i path'e sizmis - structured tool_calls
+  // path'indan da temizlenmeli (Anthropic tarafi gibi OpenAI tarafi da).
+  const payload = applyOpenAiChatNormalization({
+    id: 'chat_sanitize',
+    choices: [{
+      index: 0,
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_san',
+          type: 'function',
+          function: {
+            name: 'read',
+            arguments: '{"filePath":"index.html</Read-Ray>"}'
+          }
+        }]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: { filePath: { type: 'string' } },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  const tc = payload.choices[0].message.tool_calls[0];
+  const args = JSON.parse(tc.function.arguments);
+  assert.equal(args.filePath, 'index.html');
+});
+
+test('applyOpenAiChatNormalization collapses parallel bash tool_calls (stateful tool)', () => {
+  // Structured tool_calls array'inde birden fazla bash varsa - sadece ilki kalsin.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chat_collapse',
+    choices: [{
+      index: 0,
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'c1', type: 'function', function: { name: 'bash', arguments: '{"command":"ls -la"}' } },
+          { id: 'c2', type: 'function', function: { name: 'bash', arguments: '{"command":"pwd"}' } },
+          { id: 'c3', type: 'function', function: { name: 'bash', arguments: '{"command":"whoami"}' } }
+        ]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'bash',
+        parameters: {
+          type: 'object',
+          properties: { command: { type: 'string' } },
+          required: ['command']
+        }
+      }
+    }]
+  });
+
+  const toolCalls = payload.choices[0].message.tool_calls;
+  assert.equal(toolCalls.length, 1);
+  const args = JSON.parse(toolCalls[0].function.arguments);
+  assert.equal(args.command, 'ls -la');
+});
+
+test('applyOpenAiChatNormalization handles malformed JSON arguments gracefully', () => {
+  // Upstream bazen invalid JSON gonderir ('{broken'). Proxy patlamadan empty obj'e dusurur.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chat_malformed',
+    choices: [{
+      index: 0,
+      finish_reason: 'tool_calls',
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'c1',
+          type: 'function',
+          function: {
+            name: 'read',
+            arguments: '{"filePath":"broken'  // missing closing
+          }
+        }]
+      }
+    }]
+  }, {
+    tools: [{
+      type: 'function',
+      function: {
+        name: 'read',
+        parameters: {
+          type: 'object',
+          properties: { filePath: { type: 'string' } },
+          required: ['filePath']
+        }
+      }
+    }]
+  });
+
+  // Crash etmemeli, tool_calls array cikmali (bos input ile).
+  assert.ok(Array.isArray(payload.choices[0].message.tool_calls));
+  assert.equal(payload.choices[0].message.tool_calls.length, 1);
+});
