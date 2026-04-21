@@ -3207,11 +3207,12 @@ test('preserves legitimate HTML tags (<div>, <p>, <code>, <pre>, <ul>, <table>)'
   assert.ok(textBlock.text.includes('<table>'), 'HTML <table> preserved');
 });
 
-test('malformed completion detection works for ANY non-HTML stray close tag (model-agnostic)', () => {
-  // Critical: GPT-3.5 might stray </answer>, Llama might stray </response>,
-  // DeepSeek might stray </rationale>. All should be detected as malformed
-  // without needing a hardcoded list.
-  const strayTags = ['</answer>', '</rationale>', '</response>', '</planning>', '</scratchpad>', '</output>'];
+test('stray unclosed close tag in text passes through unchanged (proxy does NOT replace model text)', () => {
+  // Proxy must NEVER replace model's actual text with its own error message.
+  // Previous version had hasMalformedFinalText that false-positived on legit
+  // summary text where model mentioned tags ("use </xyz> syntax", etc).
+  // Model's real answer should reach the user intact.
+  const strayTags = ['</answer>', '</rationale>', '</response>', '</planning>', '</scratchpad>', '</think>'];
 
   for (const strayTag of strayTags) {
     const payload = applyAnthropicNormalization({
@@ -3231,34 +3232,20 @@ test('malformed completion detection works for ANY non-HTML stray close tag (mod
           properties: { file_path: { type: 'string' }, content: { type: 'string' } },
           required: ['file_path', 'content']
         }
-      }, {
-        name: 'Read',
-        input_schema: {
-          type: 'object',
-          properties: { file_path: { type: 'string' } },
-          required: ['file_path']
-        }
-      }],
-      messages: [
-        { role: 'user', content: 'create a file' },
-        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] },
-        { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'b.md' } }] },
-        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'y' }] }
-      ]
+      }]
     });
 
     const textBlocks = payload.content.filter((b) => b?.type === 'text');
     assert.ok(textBlocks.length > 0, `${strayTag}: text returned`);
+    // Proxy must NOT inject its own error message
     assert.ok(
-      textBlocks[0].text.includes('malformed completion'),
-      `${strayTag}: should be detected as malformed completion (model-agnostic)`
+      !textBlocks[0].text.includes('malformed completion'),
+      `${strayTag}: proxy must NOT replace model text with error message`
     );
   }
 });
 
-test('does NOT treat stray </div> (legit HTML) as malformed', () => {
-  // Counter-test: stray </div> is normal HTML fragment, not a reasoning tag.
+test('legit HTML fragments pass through unchanged', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg',
     type: 'message',
@@ -3268,85 +3255,14 @@ test('does NOT treat stray </div> (legit HTML) as malformed', () => {
       text: 'Here is some HTML fragment: hello</div>'
     }],
     stop_reason: 'end_turn'
-  }, {
-    tools: [{
-      name: 'Read',
-      input_schema: {
-        type: 'object',
-        properties: { file_path: { type: 'string' } },
-        required: ['file_path']
-      }
-    }],
-    messages: [
-      { role: 'user', content: 'explain' },
-      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }] },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] },
-      { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'b.md' } }] },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'y' }] }
-    ]
   });
 
   const textBlocks = payload.content.filter((b) => b?.type === 'text');
   assert.ok(textBlocks[0].text.includes('HTML fragment'));
-  assert.ok(!textBlocks[0].text.includes('malformed'), 'legit HTML stray tag should not trigger error');
+  assert.ok(textBlocks[0].text.includes('</div>'), 'HTML close tag preserved in text');
 });
 
-test('model claims completion with unclosed </think> but no tool_use -> returns clear error to user', () => {
-  // Real log regression: model said "Created CLAUDE.md...</think>..." with
-  // end_turn and NO tool_use. Prior turns had many reads. Model reports
-  // completion but never actually did Write. Proxy must not stall or let
-  // accidental file writes happen - return a clear error message.
-  const payload = applyAnthropicNormalization({
-    id: 'msg',
-    type: 'message',
-    role: 'assistant',
-    content: [{
-      type: 'text',
-      text: 'I need to use the Write tool properly. Let me create the file.</think>\n\nCreated CLAUDE.md with project overview.'
-    }],
-    stop_reason: 'end_turn'
-  }, {
-    tools: [{
-      name: 'Write',
-      input_schema: {
-        type: 'object',
-        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
-        required: ['file_path', 'content']
-      }
-    }, {
-      name: 'Read',
-      input_schema: {
-        type: 'object',
-        properties: { file_path: { type: 'string' } },
-        required: ['file_path']
-      }
-    }],
-    messages: [
-      { role: 'user', content: '/init' },
-      {
-        role: 'assistant',
-        content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'AGENTS.md' } }]
-      },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'content' }] },
-      {
-        role: 'assistant',
-        content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'package.json' } }]
-      },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'content' }] }
-    ]
-  });
-
-  const textBlocks = payload.content.filter((b) => b?.type === 'text');
-  assert.equal(textBlocks.length, 1);
-  assert.ok(textBlocks[0].text.includes('malformed completion'), 'should return malformed completion error');
-  assert.equal(payload.stop_reason, 'end_turn');
-  // NO tool_use injected (safe)
-  assert.equal(payload.content.filter((b) => b?.type === 'tool_use').length, 0);
-});
-
-test('well-formed end_turn with prior tool_use passes through without error wrapping', () => {
-  // Counter-test: model legitimately ended with end_turn + final summary text
-  // (no stray tags). Proxy must NOT wrap this in an error.
+test('well-formed end_turn with prior tool_use passes through unchanged', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg',
     type: 'message',
@@ -3371,18 +3287,12 @@ test('well-formed end_turn with prior tool_use passes through without error wrap
         role: 'assistant',
         content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'AGENTS.md' } }]
       },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'content' }] },
-      {
-        role: 'assistant',
-        content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'package.json' } }]
-      },
-      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'content' }] }
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'content' }] }
     ]
   });
 
   const textBlocks = payload.content.filter((b) => b?.type === 'text');
   assert.equal(textBlocks.length, 1);
-  assert.ok(!textBlocks[0].text.includes('malformed'), 'well-formed end_turn should NOT be wrapped in error');
   assert.ok(textBlocks[0].text.includes('Done!'), 'original text preserved');
 });
 
