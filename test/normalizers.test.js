@@ -3089,6 +3089,126 @@ test('Bash with pipe "cat X | head" is NOT rewritten (compound command)', () => 
   assert.equal(toolBlock.name, 'Bash', 'pipe commands must stay as Bash');
 });
 
+test('enforceWriteFromFencedContent: synthesizes Write when model emits markdown fenced + Bash but forgets Write', () => {
+  // Real log regression: model said "Let me create CLAUDE.md" + emitted
+  // ```markdown fenced block + Bash(npx serve), but NO Write tool_use.
+  // Proxy must synthesize Write so file actually gets created. Bash stays.
+  const fencedContent = '# CLAUDE.md\n\nThis file provides guidance to Claude Code.\n\n## Overview\n\nProject is a PWA dashboard with no build step. All logic lives in index.html.';
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      {
+        type: 'text',
+        text: `Let me create the CLAUDE.md file:\n\n\`\`\`markdown\n${fencedContent}\n\`\`\``
+      },
+      {
+        type: 'tool_use',
+        id: 'toolu_bash',
+        name: 'Bash',
+        input: { command: 'npx serve .' }
+      }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Write', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } },
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 1, 'Write should be synthesized');
+  assert.equal(writeBlocks[0].input.file_path, 'CLAUDE.md');
+  assert.ok(writeBlocks[0].input.content.includes('This file provides guidance'));
+
+  // Bash da korunmali
+  const bashBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Bash');
+  assert.equal(bashBlocks.length, 1, 'Bash is preserved alongside synthesized Write');
+
+  // Text'teki fenced block silinmeli (duplicate UI olmasin)
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  if (textBlock) {
+    assert.ok(!textBlock.text.includes(fencedContent), 'duplicate fenced block stripped from text');
+  }
+});
+
+test('enforceWriteFromFencedContent: NOT synthesized if Write already done earlier for same file', () => {
+  // Guard: if Write(CLAUDE.md) was already done in a prior turn, do not
+  // re-synthesize just because model is recapping with a fenced block.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '```markdown\n# CLAUDE.md\n\nHere is the content I wrote earlier. Plenty of text to pass threshold.\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      { name: 'Write', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } }
+    ],
+    messages: [
+      { role: 'user', content: '/init' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'prev', name: 'Write', input: { file_path: 'CLAUDE.md', content: '# CLAUDE.md\n\nActual written content.' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'prev', content: 'ok' }] }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'do not re-synthesize Write for already-written file');
+});
+
+test('enforceWriteFromFencedContent: NOT synthesized if fenced block is shell-output', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Let me show CLAUDE.md listing:\n\n```\n$ ls\nExit code 0\nREADME.md\nAGENTS.md\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      { name: 'Write', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'shell output should not become Write content');
+});
+
+test('enforceWriteFromFencedContent: picks filename from heading inside fenced block (language-agnostic)', () => {
+  // Language-agnostic path: the filename is inside the fenced block as a
+  // markdown heading. No heuristic about "Let me create X" needed - pure
+  // structural: first markdown heading in the block with .ext = target file.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '好的,这是内容:\n\n```markdown\n# AGENTS.md\n\n内容已经超过五十个字符的门槛,足以通过最小尺寸检查 one two three four five six seven.\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      { name: 'Write', input_schema: { type: 'object', properties: { file_path: { type: 'string' }, content: { type: 'string' } }, required: ['file_path', 'content'] } }
+    ],
+    messages: [{ role: 'user', content: '创建 AGENTS.md' }] // Chinese
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 1, 'Chinese session with filename heading in block -> Write synthesized');
+  assert.equal(writeBlocks[0].input.file_path, 'AGENTS.md');
+});
+
 test('strips "ToolCall inputs: {...}" text-leak lines from model output', () => {
   // Real log regression: glm-5 and similar weak models emit lines like
   // 'ToolCall inputs: {"file_path": "./manifest.json"}' as plain text
