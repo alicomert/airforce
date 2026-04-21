@@ -1,5 +1,6 @@
 import http from 'node:http';
 import process from 'node:process';
+import { inspect } from 'node:util';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -76,7 +77,9 @@ function logDebug(label, value) {
   if (!DEBUG_LOGS) {
     return;
   }
-  console.log(`[DEBUG] ${label}:`, value);
+  // Node'un default inspect depth 2'dir; tool_use.input ic ice oldugu icin
+  // `[Object]` seklinde cikiyor. Tani icin genislet.
+  console.log(`[DEBUG] ${label}:`, inspect(value, { depth: 5, colors: false, breakLength: 120 }));
 }
 
 function sendJson(res, status, body) {

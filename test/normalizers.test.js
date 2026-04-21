@@ -2623,6 +2623,117 @@ test('strips command-message client instrumentation tags from bash command', () 
   assert.equal(toolBlock.input.command, 'ls -la');
 });
 
+test('intent synthesis does NOT emit Write when model says "Let me read" (even with code block)', () => {
+  // Regression: proxy was synthesizing Write(settings.local.json, ./.claude/...)
+  // because model's bash output (a file listing in a ```code block```) was
+  // mistaken for file content to write. Model explicitly said "Let me read" ->
+  // no Write should be synthesized.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<details>\n<summary>Viewing all files in the repo</summary>\n\n```\n./.claude/settings.local.json\n./AGENTS.md\n./icon-192.png\n./index.html\n./manifest.json\n```\n</details>\nLet me read the key files to understand the project.'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          content: { type: 'string' }
+        },
+        required: ['file_path', 'content']
+      }
+    }, {
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }, {
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'explore the repo' }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'should not synthesize Write when model wants to read');
+});
+
+test('intent synthesis does NOT emit Write when fenced block is a file listing', () => {
+  // Even if user says "make the file", if the fenced block is just a list of
+  // paths (bash output), it is NOT file content to write.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Here are the files:\n```\n./foo.md\n./bar.md\n./baz.js\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'create a file foo.md for me' }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'should not synthesize Write from a file-listing fenced block');
+});
+
+test('intent synthesis DOES emit Write when user asks to create a file with actual code block', () => {
+  // Positive: user says 'olustur' (create), model returns fenced html code ->
+  // Write(index.html, <html>...</html>) should be synthesized.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: "I'll create the file.\n```html\n<!DOCTYPE html>\n<html><body><h1>Hello</h1></body></html>\n```"
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'index.html dosyasi olustur' }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 1);
+  assert.equal(writeBlocks[0].input.file_path, 'index.html');
+  assert.ok(writeBlocks[0].input.content.includes('<!DOCTYPE html>'));
+});
+
 test('cleans consecutive tool_use> stray text that weak models emit', () => {
   const payload = applyAnthropicNormalization({
     id: 'msg',
@@ -2640,4 +2751,160 @@ test('cleans consecutive tool_use> stray text that weak models emit', () => {
   for (const block of textBlocks) {
     assert.ok(!/tool_use>\s*tool_use>/.test(block.text ?? ''), 'consecutive tool_use> tokens should be stripped');
   }
+});
+
+// --- Dile bagimsiz intent synthesis testleri ---
+//
+// Hardcoded "let me read" / "olustur" / vs. regex'leri kaldirildi. Artik
+// sentez kararlari DETERMINISTIK sinyallerle yapiliyor: tool-history, fenced
+// block yapisi, render container, kullanici metninde dosya adi.
+// Bu yuzden testler Cince, Almanca, emoji gibi farkli dillerde de ayni
+// sonuclari vermeli.
+
+test('Write synthesis works with Chinese user request (language-agnostic)', () => {
+  // Kullanici Cince "index.html dosyasi olustur" demis; dil Cince ama
+  // "index.html" dosya adi evrensel. Deterministik sinyal: user text'inde
+  // acik dosya adi + fenced block gercek kod + render container'da degil.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '好的,\u6211\u4f1a\u521b\u5efa\u6587\u4ef6\u3002\n```html\n<!DOCTYPE html>\n<html><body>Hello</body></html>\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: '\u8bf7\u521b\u5efa index.html' } // "Please create index.html" in Chinese
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 1, 'Chinese request with explicit filename should trigger Write');
+  assert.equal(writeBlocks[0].input.file_path, 'index.html');
+});
+
+test('Write NOT synthesized when no filename in user text (deterministic guard)', () => {
+  // Dile bagimsiz kontrol: kullanicinin metninde acik dosya adi yoksa, tum
+  // fenced block'lar gercek kod gibi gorunse bile Write sentezlenmez.
+  // Ornek: model bir aciklama + kod bloku donduruyor, ama hangi dosyaya
+  // yazilacagi belli degil -> guvenli davranis, sentez yok.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Here is some code:\n```js\nconst x = 1;\nconsole.log(x);\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      // Dosya adi yok, sadece soru
+      { role: 'user', content: 'how do i log a variable' }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'no filename in user text -> Write must not be synthesized');
+});
+
+test('List/Glob synthesis only on first turn with exploratory user request', () => {
+  // Kullanicinin mesaji "hello" - acik dosya adi yok, hicbir prior tool_use
+  // yok -> exploratory fallback olarak Glob sentezle.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'hello there please explain something' }
+    ]
+  });
+
+  const globBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Glob');
+  assert.equal(globBlocks.length, 1);
+  assert.equal(globBlocks[0].input.pattern, '**/*');
+});
+
+test('List/Glob NOT synthesized when user mentions a specific file', () => {
+  // Kullanici acikca bir dosya adi belirtmis -> file-specific request, glob
+  // fallback'i dogru degil.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'text', text: '' }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'show me config.json' }
+    ]
+  });
+
+  const globBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Glob');
+  assert.equal(globBlocks.length, 0, 'user mentioned config.json -> no Glob fallback');
+});
+
+test('Write NOT synthesized when fenced block is inside <details> render container', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<details>\n<summary>Output</summary>\n\n```\nactual content here\n```\n</details>'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'make config.json for me' }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'block inside <details> is a render container, not file content');
 });
