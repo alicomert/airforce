@@ -2761,6 +2761,96 @@ test('cleans consecutive tool_use> stray text that weak models emit', () => {
 // Bu yuzden testler Cince, Almanca, emoji gibi farkli dillerde de ayni
 // sonuclari vermeli.
 
+test('drops Write tool_use with empty content (would overwrite file with blank)', () => {
+  // Regression from real log: model emitted Write(CLAUDE.md, content: '')
+  // first, then real content in next turn. The first call, if passed through,
+  // overwrites the existing file with empty. Proxy must drop it and let the
+  // model retry.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'tool_use',
+      id: 'toolu_empty_write',
+      name: 'Write',
+      input: { file_path: 'CLAUDE.md', content: '', filePath: 'CLAUDE.md' }
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          content: { type: 'string' }
+        },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'create CLAUDE.md' }
+    ]
+  });
+
+  const writeBlocks = payload.content.filter((b) => b?.type === 'tool_use' && b?.name === 'Write');
+  assert.equal(writeBlocks.length, 0, 'empty content Write should be dropped');
+});
+
+test('strips post-Write duplicate fenced block from text (model re-prints content)', () => {
+  // Weak models after a successful Write(X, content) often print the same
+  // content again as a fenced block in the next turn, thinking they are
+  // summarizing. Claude Code renders that text literally; user thinks the
+  // file was not written. This deterministic cleanup removes the duplicate.
+  const writtenContent = '# CLAUDE.md\n\nThis file provides guidance to Claude Code when working with code in this repository.\n\n## Overview\n\nLine 5.\nLine 6.\nLine 7.';
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '```\n' + writtenContent + '\n```'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'create CLAUDE.md' },
+      {
+        role: 'assistant',
+        content: [{
+          type: 'tool_use',
+          id: 'toolu_write_prev',
+          name: 'Write',
+          input: { file_path: 'CLAUDE.md', content: writtenContent }
+        }]
+      },
+      {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'toolu_write_prev',
+          content: 'File created successfully'
+        }]
+      }
+    ]
+  });
+
+  // Fenced block silinmeli; post-Write duplicate basma tespit edildi.
+  const textBlocks = payload.content.filter((b) => b?.type === 'text');
+  for (const block of textBlocks) {
+    assert.ok(!block.text.includes(writtenContent), 'duplicate content should be stripped');
+  }
+});
+
 test('Write synthesis works with Chinese user request (language-agnostic)', () => {
   // Kullanici Cince "index.html dosyasi olustur" demis; dil Cince ama
   // "index.html" dosya adi evrensel. Deterministik sinyal: user text'inde
