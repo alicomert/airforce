@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import {
   maybeRewriteModel,
   normalizeJsonPayload,
+  normalizeRequestMessages,
+  normalizeRequestTools,
   restorePresentedModel
 } from './lib/normalizers.js';
 import {
@@ -196,14 +198,34 @@ const server = http.createServer(async (req, res) => {
         : []
     });
     const shouldStreamLocally = shouldHandleSyntheticStream(requestUrl.pathname, parsedBody);
+    const upstreamPath = mapUpstreamPath(requestUrl.pathname);
+    let bodyToNormalize = shouldStreamLocally ? { ...parsedBody, stream: false } : parsedBody;
+    if (parsedBody?.messages) {
+      const lastMsg = parsedBody.messages[parsedBody.messages.length - 1];
+      if (lastMsg?.role === 'assistant' && lastMsg?.content) {
+        const contentStr = typeof lastMsg.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg.content);
+        logDebug('raw_assistant_content', contentStr.slice(0, 800));
+      }
+    }
     const upstreamBody = parsedBody
-      ? maybeRewriteModel(
-        shouldStreamLocally ? { ...parsedBody, stream: false } : parsedBody,
-        MODEL_ALIASES
+      ? normalizeRequestTools(
+        normalizeRequestMessages(
+          maybeRewriteModel(bodyToNormalize, MODEL_ALIASES),
+          upstreamPath
+        ),
+        upstreamPath
       )
       : null;
+    if (upstreamBody?.messages) {
+      const lastMsg = upstreamBody.messages[upstreamBody.messages.length - 1];
+      if (lastMsg?.role === 'assistant') {
+        const content = lastMsg?.content;
+        if (Array.isArray(content)) {
+          logDebug('normalized_tool_calls', content.filter((b) => b?.type === 'tool_use').map((b) => ({ name: b.name, input: b.input })));
+        }
+      }
+    }
     const encodedUpstreamBody = upstreamBody ? JSON.stringify(upstreamBody) : undefined;
-    const upstreamPath = mapUpstreamPath(requestUrl.pathname);
     const upstreamUrl = new URL(upstreamPath + requestUrl.search, UPSTREAM_BASE_URL);
 
     const upstreamResponse = await fetch(upstreamUrl, {
