@@ -2761,6 +2761,42 @@ test('cleans consecutive tool_use> stray text that weak models emit', () => {
 // Bu yuzden testler Cince, Almanca, emoji gibi farkli dillerde de ayni
 // sonuclari vermeli.
 
+test('/init wrapped in <command-name> XML tag still triggers Glob synthesis', () => {
+  // Real log regression: Claude Code wraps /init as <command-name>/init</command-name>.
+  // Old regex required whitespace before `/`, so `>/init` did not match and
+  // no synthesis happened -> stall. New regex allows XML-tag boundary (>, ", etc).
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: "I'll start by exploring the repository structure and key files."
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Glob',
+      input_schema: {
+        type: 'object',
+        properties: { pattern: { type: 'string' } },
+        required: ['pattern']
+      }
+    }],
+    messages: [
+      {
+        role: 'user',
+        content: '<command-name>/init</command-name>\n<system-reminder>skills available</system-reminder>'
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b?.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1, '/init inside XML tags must still trigger synthesis');
+  assert.equal(toolBlocks[0].name, 'Glob');
+  assert.equal(toolBlocks[0].input.pattern, '**/*');
+});
+
 test('drops Write tool_use with empty content (would overwrite file with blank)', () => {
   // Regression from real log: model emitted Write(CLAUDE.md, content: '')
   // first, then real content in next turn. The first call, if passed through,
