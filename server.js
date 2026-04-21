@@ -41,10 +41,19 @@ const UPSTREAM_RETRY_MAX_MS = Math.max(200, Number(process.env.UPSTREAM_RETRY_MA
 // veya 3 dakika (normal). Modeller artik daha hizli, 3dk fazla.
 const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || (FAST_MODE ? 120000 : 180000)));
 // Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
-// FAST_MODE: 1 retry (default). Yeni normalizer empty response'u cok azaltti.
-// Normal: 3 retry.
+// Her retry'da upstream prompt'una daha direkt bir nudge eklenir; conversation
+// state (messages history) DEGISMEZ, sadece request body icindeki system
+// bolumune temporary bir hint eklenir. Bu, zayif modelleri (glm-5 vb.) tool
+// kullanmaya ittirir ve kullanicinin "sistem durdu" deneyimini onler.
+//
+// Butce: toplam `EMPTY_RESPONSE_BUDGET_MS` (default FAST_MODE'da 60s, normal
+// 120s) boyunca retry devam eder. Tek upstream cagri timeout'u (UPSTREAM_
+// TIMEOUT_MS) bundan bagimsizdir. Safety net olarak 10 retry hard limit var
+// - upstream cok hizli cevap donup bos geliyorsa bile butce kullanici bekleme
+// toleransini asmasin.
 const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
-const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || (FAST_MODE ? 1 : 3)));
+const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 10));
+const EMPTY_RESPONSE_BUDGET_MS = Math.max(5000, Number(process.env.EMPTY_RESPONSE_BUDGET_MS || (FAST_MODE ? 60000 : 120000)));
 
 function parseAliases(raw) {
   if (!raw) {
@@ -267,6 +276,99 @@ function injectEmptyResponseFallback(pathname, payload) {
   return payload;
 }
 
+// Bos cevap durumunda upstream'e yeniden cagri atarken, modeli tool kullanimina
+// tesvik eden bir "nudge" ekler. Conversation state DEGISMEZ: sadece request
+// body'nin system bolumune gecici bir hint yazilir. Nudge'lar dile bagimsiz,
+// yapisal. Her retry'da artan bir siddetle:
+//   Level 1: nazik hatirlatma
+//   Level 2: daha acik (tool kullanma zorunlulugu)
+//   Level 3+: sonuc odakli ("son turdaki goreve geri don")
+function buildEmptyRetryNudge(attempt, priorToolCategories) {
+  const hasExploration = priorToolCategories.has('bash') || priorToolCategories.has('list') || priorToolCategories.has('grep') || priorToolCategories.has('read');
+  const hasMutation = priorToolCategories.has('write') || priorToolCategories.has('edit');
+
+  // Temel mesaj her seviyede ayni dil-bagimsiz yapisal talimat
+  const parts = [
+    '[airforce-proxy retry nudge]',
+    `Your previous response had no tool_use block and no text content.`
+  ];
+
+  if (attempt === 1) {
+    parts.push('If the user asked for an action, call the appropriate tool. If you need more information, produce a short clarifying text instead of an empty reply.');
+  } else if (attempt === 2) {
+    parts.push('Previous retry also returned empty. You MUST produce either a tool_use block (preferred if the user requested an action) or at least one non-empty text block explaining the blocker.');
+  } else {
+    // 3+ - en direkt
+    parts.push('Multiple retries returned empty responses. Do ONE of the following right now: (a) emit a tool_use block that progresses the task, or (b) emit a text block describing exactly what information or clarification you need from the user. Do not return empty content.');
+  }
+
+  // Context-aware ekleme: onceki turlarda kesif yapildi ama yazma yok
+  if (hasExploration && !hasMutation) {
+    parts.push('The session already performed exploration tool calls. If the user asked you to create, modify, or generate a file, you likely have enough context to invoke the write/edit tool now.');
+  }
+
+  return parts.join(' ');
+}
+
+// Request body'ye gecici nudge ekle. Anthropic format (system: string|array)
+// ve OpenAI chat format (messages icinde role:'system') ikisini de destekle.
+function injectEmptyRetryNudgeIntoBody(parsedBody, upstreamBody, pathname, nudgeText) {
+  if (!upstreamBody || typeof upstreamBody !== 'object') return upstreamBody;
+
+  if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
+    const existing = upstreamBody.system;
+    let newSystem;
+    if (existing == null || existing === '') {
+      newSystem = nudgeText;
+    } else if (typeof existing === 'string') {
+      newSystem = `${existing}\n\n${nudgeText}`;
+    } else if (Array.isArray(existing)) {
+      newSystem = [...existing, { type: 'text', text: nudgeText }];
+    } else {
+      newSystem = existing;
+    }
+    return { ...upstreamBody, system: newSystem };
+  }
+
+  if (pathname.endsWith('/chat/completions') || pathname.endsWith('/responses')) {
+    const messages = Array.isArray(upstreamBody.messages) ? upstreamBody.messages : [];
+    const newMessages = [
+      ...messages,
+      { role: 'system', content: nudgeText }
+    ];
+    return { ...upstreamBody, messages: newMessages };
+  }
+
+  return upstreamBody;
+}
+
+// Request body'de daha once hangi tool kategorileri kullanildi? Dil-bagimsiz,
+// tool adini proxy'nin bildigi alias listesiyle eslesir. Returns Set of
+// category strings: 'bash', 'read', 'write', 'edit', 'list', 'grep'.
+function collectPriorToolCategories(parsedBody) {
+  const categories = new Set();
+  const messages = Array.isArray(parsedBody?.messages) ? parsedBody.messages : [];
+  // Simple inline mapping - tool name (case-insensitive, normalize) -> category
+  const categoryMap = {
+    bash: 'bash', shell: 'bash', exec: 'bash', powershell: 'bash',
+    read: 'read', readfile: 'read', read_file: 'read', openfile: 'read', viewfile: 'read',
+    write: 'write', writefile: 'write', write_file: 'write', createfile: 'write',
+    edit: 'edit', editfile: 'edit', strreplace: 'edit', multiedit: 'edit',
+    glob: 'list', listdirectory: 'list', list_directory: 'list', findfiles: 'list',
+    grep: 'grep', search: 'grep', ripgrep: 'grep', contentsearch: 'grep'
+  };
+  for (const msg of messages) {
+    if (msg?.role !== 'assistant' || !Array.isArray(msg?.content)) continue;
+    for (const block of msg.content) {
+      if (block?.type !== 'tool_use') continue;
+      const name = String(block?.name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+      const cat = categoryMap[name];
+      if (cat) categories.add(cat);
+    }
+  }
+  return categories;
+}
+
 // Upstream'e fetch + timeout + retry. Network hatasi, 5xx, 408/425/429'da otomatik yeniden dener.
 // 4xx (429 disinda) ve 2xx/3xx durumunda response'u oldugu gibi dondurur.
 async function fetchUpstreamWithRetry(upstreamUrl, fetchOptions, logLabel) {
@@ -421,11 +523,15 @@ const server = http.createServer(async (req, res) => {
       body: encodedUpstreamBody
     };
 
-    // Ana loop: upstream'i cagir, normalize et. Normalize sonrasi cevap effectively
-    // bossa (hic text, hic tool_use) 1 kere daha upstream'i yeniden cagir. Bu
-    // "model bazen hic cevap uretmiyor" durumunu absorbe eder. Asiri retry
-    // (3x) istemciyi bekletir - EMPTY_RESPONSE_MAX_RETRIES ile kontrol edilir.
+    // Ana loop: upstream'i cagir, normalize et. Bos cevap gelirse nudge'li
+    // follow-up ile yeniden cagir. Loop, suresi bittiginde veya hard limit'e
+    // ulastiginda durur (EMPTY_RESPONSE_BUDGET_MS butcesi kullanici bekleme
+    // toleransini asmaz). Conversation state DEGISMEZ - sadece request body'nin
+    // system bolumune gecici bir nudge eklenir.
     const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? EMPTY_RESPONSE_MAX_RETRIES : 0;
+    const emptyRetryDeadline = Date.now() + EMPTY_RESPONSE_BUDGET_MS;
+    const priorToolCategories = collectPriorToolCategories(parsedBody);
+
     let upstreamResponse;
     let contentType = '';
     let upstreamText = '';
@@ -433,9 +539,13 @@ const server = http.createServer(async (req, res) => {
     let rawPayload = null;
     let nonJsonPassthrough = false;
     let lastWasEmpty = false;
+    // Her retry'da farkli nudge ile body'i yeniden uret. Ilk cagri (emptyAttempt=0)
+    // normal body kullanir; sonraki cagrilarda nudge eklenir.
+    let currentEncodedBody = encodedUpstreamBody;
+    let currentFetchOptions = upstreamFetchOptions;
 
     for (let emptyAttempt = 0; emptyAttempt <= maxEmptyRetries; emptyAttempt += 1) {
-      upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, upstreamFetchOptions, `${req.method} ${upstreamPath}`);
+      upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, currentFetchOptions, `${req.method} ${upstreamPath}`);
       contentType = upstreamResponse.headers.get('content-type') || '';
       upstreamText = await upstreamResponse.text();
 
@@ -453,21 +563,34 @@ const server = http.createServer(async (req, res) => {
       const noProgress = isNoProgressAssistantTurn(requestUrl.pathname, payload);
       lastWasEmpty = noProgress;
 
-      // Basarili response ama normalize sonrasi bomboss → bir daha cagir
-      if (
+      // Basarili response + effectively empty → nudge'li yeniden cagri
+      const canRetry =
         upstreamResponse.status >= 200 && upstreamResponse.status < 300 &&
         RETRY_ON_EMPTY_RESPONSE &&
         emptyAttempt < maxEmptyRetries &&
-        noProgress
-      ) {
+        Date.now() < emptyRetryDeadline &&
+        noProgress;
+
+      if (canRetry) {
+        const nextAttempt = emptyAttempt + 1;
+        const nudge = buildEmptyRetryNudge(nextAttempt, priorToolCategories);
+        const nudgedBody = injectEmptyRetryNudgeIntoBody(parsedBody, upstreamBody, upstreamPath, nudge);
+        currentEncodedBody = JSON.stringify(nudgedBody);
+        currentFetchOptions = {
+          ...upstreamFetchOptions,
+          headers: buildUpstreamHeaders(req, Buffer.byteLength(currentEncodedBody)),
+          body: currentEncodedBody
+        };
+
         logDebug('upstream_empty_payload_retry', {
-          attempt: emptyAttempt + 1,
+          attempt: nextAttempt,
           path: requestUrl.pathname,
           reason: effectivelyEmpty ? 'empty' : 'no_progress',
+          budget_remaining_ms: Math.max(0, emptyRetryDeadline - Date.now()),
           raw_content_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.content) ? rawPayload.content.length : undefined,
           raw_choices_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.choices) ? rawPayload.choices.length : undefined
         });
-        await sleep(backoffDelay(emptyAttempt + 1));
+        await sleep(backoffDelay(nextAttempt));
         continue;
       }
       break;

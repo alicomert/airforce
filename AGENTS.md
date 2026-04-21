@@ -4,66 +4,105 @@ Compact guide for working in this repo. See `README.md` and `CLAUDE.md` for user
 
 ## Stack
 
-- Pure ESM Node.js project (`"type": "module"` in `package.json`). No TypeScript, no bundler, no linter, no formatter. Zero runtime dependencies.
+- Pure ESM Node.js project (`"type": "module"`). No TypeScript, no bundler, no linter, no formatter. Zero runtime dependencies — anything new must use `node:` built-ins.
 - Source files:
   - `server.js` — HTTP server + routing + upstream retry + keep-alive
-  - `lib/normalizers.js` — all the weird tool-call / `<think>` / XML-ish text normalization (~1700 lines; this is the bulk of the logic)
-  - `lib/intent-synthesis.js` — when upstream model answers with plain text instead of tool_use blocks, this module synthesizes the right tool_use from the model's intent (write/read/list/etc). Cross-platform, project-agnostic, **language-agnostic** (v2: no hardcoded "let me read" / "olustur" regexes — decisions use deterministic signals: tool history, fenced block structure, render containers, explicit filenames, slash-commands). Uses the client's own tool names.
-  - `lib/system-prompt-injection.js` — **default OFF** (`INJECT_SYSTEM_PROMPT=1` to opt in). When enabled, proxy injects a soft "tool usage guidance" block into the system prompt built from the client's own tool list + schemas. Non-forcing — uses "prefer tool calls" rather than "MUST call". Known trade-off: some weaker models see the suggested signatures like `Write(file_path, content)` and emit OpenAI-style JSON (`{"name":"Read",…}`) instead of native Anthropic `tool_use` blocks, producing `No such tool available` errors in Claude Code. That's why it is opt-in. Intent synthesis below is the safer path for most deployments.
-  - `lib/sse.js` — synthesizes Anthropic & OpenAI streaming responses from a single non-stream upstream JSON reply
-- Tests: `node:test` under `test/`, fixtures under `testdata/`.
+  - `lib/normalizers.js` — tool-call / chain-of-thought / XML-ish text normalization (~2200 lines; the bulk of the logic)
+  - `lib/intent-synthesis.js` — when upstream answers with plain text instead of `tool_use`, synthesizes a tool call from deterministic signals (tool history, fenced block structure, render containers, explicit filenames, slash-commands). No hardcoded natural-language phrases. Uses the client's declared tool names.
+  - `lib/system-prompt-injection.js` — **default ON** (`INJECT_SYSTEM_PROMPT=0` to opt out). Injects a dynamic tool contract (built from the client's tool list + schemas) into the system prompt to nudge weaker models toward calling tools instead of replying in text. Known trade-off: a few weak models emit OpenAI-style `{"name":"X",…}` JSON after seeing signatures, which surfaces as `No such tool available` in Claude Code — disable via env if you hit this.
+  - `lib/sse.js` — synthesizes Anthropic & OpenAI SSE streams from a single non-stream upstream JSON reply
+- Tests: `node:test` under `test/`, fixtures under `testdata/`. ~120 cases in `normalizers.test.js` alone.
 
 ## Commands
 
-- Run everything: `npm test` (equivalent to `node --test`). Runs both test files; fast, no services needed.
-- Run one file: `node --test test/normalizers.test.js`
-- Run one test by name: `node --test --test-name-pattern="extractPseudoToolCalls parses" test/normalizers.test.js`
+- `npm test` — runs all tests via `node --test`. No services needed.
+- Single file: `node --test test/normalizers.test.js`
+- Single test: `node --test --test-name-pattern="extractPseudoToolCalls parses" test/normalizers.test.js`
 - Start server: `PORT=2393 UPSTREAM_BASE_URL=https://api.airforce AIRFORCE_API_KEY=... node server.js`
-- Health check: `GET /health` returns configured upstream, port, and aliases.
+- Health: `GET /health` returns configured upstream, port, aliases.
 
-There is no lint/typecheck step. Just run tests.
+No lint or typecheck. Run tests.
 
-## Non-obvious behavior to preserve
+## Core principle
 
-- **Only `/anthropic/*` and `/v1/*` are proxied.** Anything else returns 404. `/anthropic` prefix is stripped before forwarding (`mapUpstreamPath`).
-- **Inbound auth is always replaced.** `authorization` and `x-api-key` headers from the client are dropped; if `AIRFORCE_API_KEY` is set it is injected as both `Bearer` and `x-api-key`. Don't "pass through" client credentials.
-- **Synthetic streaming.** When the client sends `stream: true` on `/anthropic/*`, `/v1/messages`, or `*/chat/completions`, the proxy calls upstream with `stream: false`, normalizes the full JSON, then re-emits it as SSE via `lib/sse.js`. Response carries `x-airforce-proxy-stream: synthetic`. If you add a new streaming path, update both `shouldHandleSyntheticStream` (server.js) and the branch picking the SSE encoder.
-- **Upstream retry is automatic.** `fetchUpstreamWithRetry` retries on network errors, timeouts, 408/425/429, and 5xx with exponential backoff + jitter. On top of that, if normalize leaves the payload "effectively empty" (no text, no tool_use, no thinking), the proxy re-calls upstream (`RETRY_ON_EMPTY_RESPONSE`). Defaults are controlled by `FAST_MODE` env (default ON): `FAST_MODE=1` uses 3 attempts, 150ms base backoff, 1.5s max, 120s upstream timeout, 1 empty-retry. `FAST_MODE=0` reverts to 4/300/3000/180s/3. Knobs (all optional env): `UPSTREAM_MAX_ATTEMPTS`, `UPSTREAM_RETRY_BASE_MS`, `UPSTREAM_RETRY_MAX_MS`, `UPSTREAM_TIMEOUT_MS`, `EMPTY_RESPONSE_MAX_RETRIES`, `RETRY_ON_EMPTY_RESPONSE=0` to disable empty-retry entirely. `isNoProgressAssistantTurn` is language-agnostic as of v2: only the proxy's own empty-response fallback text triggers retry (previously any "Let me check..." text did, which was language-dependent and over-triggered retries).
-- **Model aliasing is two-way.** `maybeRewriteModel` swaps client model → upstream model on the way out; `restorePresentedModel` puts the client's original model name back on the response. On `/models` endpoints, `appendAliasModels` also injects alias ids so clients see them in the list. Keep both directions consistent when touching alias logic.
-- **Non-JSON upstream responses are passed through untouched** (status, content-type, body) — normalization only runs when `content-type` contains `application/json`.
-- **`DEBUG_LOGS` is on by default.** Set `DEBUG_LOGS=0` to silence. Logs are verbose and include truncated message/tool summaries; keep them terse if you add more.
+**The proxy never replaces the model's actual text output with a synthetic error or summary.** It may sanitize XML-like reasoning artifacts, synthesize missing `tool_use` blocks, or drop demonstrably broken tool calls — but it will not overwrite a user-facing text answer. Violations of this were real shipped bugs (`hasMalformedFinalText`, removed) that false-positived on legitimate summary replies. If you're tempted to add "if text looks wrong, swap it for our message", resist.
+
+## Non-obvious server behavior
+
+- **Only `/anthropic/*` and `/v1/*` are proxied.** Everything else returns 404. `/anthropic` prefix is stripped before forwarding (`mapUpstreamPath`).
+- **Inbound auth is always replaced.** Client `authorization` and `x-api-key` are dropped; if `AIRFORCE_API_KEY` is set it's injected as both `Bearer` and `x-api-key`. Do not pass through client credentials.
+- **Synthetic streaming.** When `stream: true` hits `/anthropic/*`, `/v1/messages`, or `*/chat/completions`, the proxy calls upstream with `stream: false`, normalizes the full JSON, then re-emits it as SSE via `lib/sse.js`. Response carries `x-airforce-proxy-stream: synthetic`. Any new streaming path needs `shouldHandleSyntheticStream` in `server.js` AND the correct encoder branch.
+- **Upstream retry is automatic.** `fetchUpstreamWithRetry` retries on network errors, timeouts, 408/425/429, and 5xx with exponential backoff + jitter. Separately, if normalize returns an "effectively empty" payload, the proxy re-calls upstream with a **nudge-augmented request body** — a temporary `system` hint that escalates across retries (level 1: gentle reminder; level 2: "you MUST produce tool_use or text"; level 3+: "pick between tool_use or a clarifying text"). Conversation state (messages history) is never mutated; the nudge only lives in the retry's request body. Loop continues until the empty-retry **budget** (`EMPTY_RESPONSE_BUDGET_MS`, default 60s in FAST_MODE, 120s otherwise) is exhausted or the hard-limit `EMPTY_RESPONSE_MAX_RETRIES` (default 10) is hit. Defaults from `FAST_MODE` (default ON):
+  - `FAST_MODE=1`: 3 per-call attempts, 150ms base, 1.5s max, 120s per-call timeout, 10-retry/60s empty-retry budget
+  - `FAST_MODE=0`: 4 / 300ms / 3s / 180s / 10-retry/120s budget
+  - Override individually: `UPSTREAM_MAX_ATTEMPTS`, `UPSTREAM_RETRY_BASE_MS`, `UPSTREAM_RETRY_MAX_MS`, `UPSTREAM_TIMEOUT_MS`, `EMPTY_RESPONSE_MAX_RETRIES`, `EMPTY_RESPONSE_BUDGET_MS`, `RETRY_ON_EMPTY_RESPONSE=0` to disable.
+  - `isNoProgressAssistantTurn` is language-agnostic: only the proxy's own empty-response fallback text triggers retry. An earlier version regexed "Let me check..."-style text, which was language-biased and caused redundant retries.
+  - Nudge text itself is language-agnostic: structural (`"Your previous response had no tool_use block and no text content. Do ONE of..."`). Context-aware — if prior tool_use history shows exploration without mutation, nudge mentions "you likely have enough context to invoke write/edit now".
+- **Model aliasing is two-way.** `maybeRewriteModel` swaps client → upstream model on request; `restorePresentedModel` puts the client's name back on response. `/models` also injects alias IDs via `appendAliasModels`. Keep both sides in sync.
+- **Non-JSON upstream responses pass through untouched** (status, content-type, body). Normalization only runs when `content-type` contains `application/json`.
+- **`DEBUG_LOGS=1` by default**, very verbose. Uses `util.inspect(depth:5)` so tool_use input is visible (older version showed `[Object]`). Set `DEBUG_LOGS=0` to silence.
+- HTTP server `keepAliveTimeout: 30s` and `headersTimeout: 35s` for ardisik tool-call turns (client-side TCP reuse).
 
 ## Normalization layer (`lib/normalizers.js`)
 
 This is the hard-earned core. Before editing:
 
-- Entry points used by the server: `normalizeJsonPayload(pathname, payload, requestBody)`, `normalizeRequestMessages`, `normalizeRequestTools`, `maybeRewriteModel`, `restorePresentedModel`. Internally it dispatches to `applyAnthropicNormalization`, `applyOpenAiChatNormalization`, `applyOpenAiResponsesNormalization` based on path.
-- `extractPseudoToolCalls` is the text → tool_use extractor. It handles `<think>`, `<tool_call>`, `<tool_use>`, `<arg_key>/<arg_value>`, fenced `json`/`bash`, `<file://…>` write blocks, and various XML-ish variants. Many tests assert exact text trimming — if you change whitespace handling, expect snapshot-like failures in `test/normalizers.test.js`.
-- Tool-name aliasing (`TOOL_NAME_ALIASES`, `ARG_SYNONYMS`, `SHELL_COMMAND_ALIASES`) is how upstream's weird tool emissions get mapped back to the client's declared tool schema. New aliases go there, not in call sites.
-- `sanitizeCommand` strips several classes of upstream garbage from bash commands: (1) trailing XML/markdown tag artifacts, (2) trailing UI-render labels like `(fetching file listing)` / `(running command)` via `UI_LABEL_SUFFIX_RE`, (3) Claude Code / OpenCode instrumentation tags — both underscore (`<command_message>`) and dash (`<command-message>`) variants of `command[_-]message`, `system[_-]reminder`, `local[_-]command(-std(out|err))?`, `user[_-]message`, `assistant[_-]message`, `tool[_-]output`, `claude[_-]instructions` (`INSTRUMENTATION_TAG_RE`, `INSTRUMENTATION_BLOCK_RE`), (4) erroneous leading single-dash prefix (`-find .` → `find .`) that upstream models sometimes produce. Preserve all of these; every one traces back to a real broken log.
-- `sanitizeToolText` also strips stray multi-line `tool_use>` tokens that weak models emit as plain text (e.g. `"tool_use>\n\ntool_use>\n\ntool_use>"`). The regex uses a multi-occurrence matcher so both single-line and multi-line runs get collapsed.
-- **Read loop suppression across ALL prior turns** (`suppressRepeatedReadToolCalls`). Previously this only checked the immediately previous assistant message for Read targets. Weak models (glm-5) keep emitting `Read AGENTS.md` in turn 1, 3, 5, 7 thinking the file was empty each time, loop-locking the agent. `collectAllPreviousReadTargets` now scans the entire message history; any Read of a file already read in ANY prior turn is dropped, forcing intent synthesis to pick a different file from the tool_result context (respecting the same "already-read" blocklist, so progress is always made).
-- `sanitizeToolInputString` runs the same cleanup for non-command string fields. `coerceToolInput` applies it to a whitelist of path-like fields (`file_path`, `filePath`, `path`, `pattern`, `file`, `filename`, `source`, `destination`, `old_string`, `new_string`, `search`, `find`, `replace`, `replacement`). **Never sanitize `content` / `text` / `body` / `query` / `description`** — these legitimately contain XML/HTML or free-form text. The whitelist is explicit in `normalizers.js`; add new fields only after verifying they can't contain user content.
-- **Schema shape sync for read/write/edit.** `coerceToolInput` always fills every path field name synonymously: if upstream sent `file_path`, the proxy also populates `filePath` and `path` (and vice versa) with the same value. Different clients validate different naming conventions — OpenCode's Zod schema requires `filePath` (camelCase), Claude Code uses `file_path` (snake_case). Without this sync the proxy would pass `Invalid input: expected string, received undefined` errors into the client and the assistant would loop. Same treatment is applied to `write`/`edit`. The only field that is NOT synced this way is `content` for `write` (it is the file body, not a path).
-- **Structured OpenAI `tool_calls` are canonicalized on response.** When upstream already emits a `tool_calls` array (not text-embedded), proxy parses each `tool_calls[].function.arguments`, runs them through `canonicalizeToolCalls` (same path as text-embedded tool calls), and re-stringifies. This applies schema sync (`file_path` ↔ `filePath`) and sanitization to pre-structured tool calls — making the proxy OpenCode-compatible for weak models that send structured JSON instead of tool_use blocks.
-- **Empty tool_use drops (value-level, not key-level).** Weak upstream models (glm-5) frequently emit `{type:'tool_use', name:'Read', input:{}}` or similar broken blocks with no actual arguments. `coerceToolInput` fills synonym fields with `undefined`, so the older `Object.keys(input).length === 0` check let these through (keys existed, values didn't). `hasAnyDefinedValue` now inspects values and drops broken calls. Per-tool path/pattern validation follows: read/write/edit require a non-empty path, glob requires a pattern, grep requires a pattern. When all tool_use blocks get dropped this way, `applyAnthropicNormalization` hands off to intent synthesis (which can pick a file from prior `tool_result` context) instead of propagating an empty tool_use that would trigger client-side Zod validation errors and kill the session.
-- **Bogus bash command filter.** `isBogusBashCommand` drops bash calls whose `command` is just a tool name (`bash`, `read`, `context`, `message`, `parameters`, …) or an orphan CLI flag (`:message=...`, `-message=...`, `--param=...`). These are traces of the model whispering to itself rather than real shell commands; executing them produces `exit 127 command not found` which breaks the agent loop with no useful output.
-- **Parallel tool-call collapse.** Upstream sometimes emits 5-6 bash calls in one turn; Anthropic clients run them in parallel and if any one fails, the remainder is cancelled with "parallel tool call errored" and the whole session locks up. `collapseParallelToolCalls` keeps only the first call per STATEFUL tool per turn (bash, delete, write, edit). Stateless tools (read, glob, grep, webfetch, task) are NOT collapsed — multiple reads in one turn are fine. Command content is never modified, only duplicate stateful calls are dropped. Disable via `COLLAPSE_PARALLEL_TOOL_CALLS=0`. Applies to all three normalizers (Anthropic, OpenAI chat, OpenAI responses).
-- **Intent synthesis** (`lib/intent-synthesis.js`). Weak upstream models (glm-5 and similar) sometimes produce plain text responses even when a tool call is warranted — they emit HTML in a fenced block instead of calling `Write`, or say "Let me first check the repo" without any `Glob`/`Read` call. The intent synthesizer looks at the model's text + the last user message, and if a clear intent is visible, manufactures the right tool call **using the client's own tool list**. Three heuristics: (1) fenced code block + filename mentioned in user or model text → `Write`-like tool (`Write`/`write_file`/`WriteFile` etc.); (2) exploratory stall like "Let me check" + user said `/init` / "analyze" / "incele" → `Glob`-like tool with `pattern: '**/*'` (cross-platform, relative); (3) "let me read X.md" with a single file → `Read`-like tool. Must stay project-agnostic: no hardcoded paths (`/workspace`, `/root`), no Linux-only commands (`find .`). Schema field names are picked dynamically from the client's declared tool schema (`file_path` vs `filePath` vs `path`). Disable via `SYNTHESIZE_INTENT=0`.
-- When the normalizer empties `content` that originally had blocks, `server.js` logs `normalization_emptied_content` with truncated raw blocks. That log is a canary — if you see it firing in a new test, the normalizer is eating legitimate output.
-- If upstream returned `stop_reason: "tool_use"` but the normalizer dropped all tool_use blocks (broken/empty), `applyAnthropicNormalization` downgrades `stop_reason` to `end_turn` so Anthropic clients don't lock up with "parallel tool error".
+- **Entry points:** `normalizeJsonPayload(pathname, payload, requestBody)`, `normalizeRequestMessages`, `normalizeRequestTools`, `maybeRewriteModel`, `restorePresentedModel`. Internally dispatches to `applyAnthropicNormalization`, `applyOpenAiChatNormalization`, `applyOpenAiResponsesNormalization` based on path.
+- **`extractPseudoToolCalls`** is the text → tool_use extractor. Handles `<tool_call>`, `<tool_use>`, `<arg_key>/<arg_value>`, fenced `json`/`bash`, `<file://…>` write blocks, and various XML-ish variants. Many tests assert exact text trimming — changing whitespace handling breaks snapshots.
+- **Tool-name aliasing** lives in `TOOL_NAME_ALIASES`, `ARG_SYNONYMS`, `SHELL_COMMAND_ALIASES`. New aliases go here, not in call sites.
+
+### Model-agnostic reasoning cleanup
+
+- **No hardcoded reasoning tag lists.** `LEGIT_HTML_TAG_NAMES` is a whitelist of standard HTML/XML elements. Any non-whitelist tag (`<think>`, `<thinking>`, `<reasoning>`, `<scratchpad>`, `<planning>`, `<rationale>`, whatever future model emits) is treated as reasoning/generator artifact. This keeps the proxy working for GPT-3.5, Llama, Mistral, DeepSeek, Gemini, and anything not-yet-released without code changes.
+- **`stripNonHtmlStructuredBlocks`** (in `cleanText`): any balanced `<X>…</X>` block where `X` is not a legit HTML tag gets removed with its inner content. So chain-of-thought is hidden from users.
+- **`sanitizeCommand`** uses the same whitelist for trailing close-tag removal on bash commands (non-HTML `</X>...` suffix is stripped; legit HTML close tags are preserved). Also strips trailing UI labels (`(fetching file listing)` etc. via `UI_LABEL_SUFFIX_RE`), Claude Code / OpenCode instrumentation tags — underscore and dash variants of `command[_-]message`, `system[_-]reminder`, `local[_-]command(-std(out|err))?`, `user[_-]message`, `assistant[_-]message`, `tool[_-]output`, `claude[_-]instructions` — and fixes erroneous leading `-cmd` prefixes.
+- **`sanitizeToolText`** strips stray multi-line `tool_use>` runs that weak models emit as plain text, and loose `<content>` tag leaks.
+
+### Broken tool-call filtering
+
+- **Empty tool_use value check.** `hasAnyDefinedValue` rejects tool_use blocks whose input values are all `undefined`/null/empty-string, even when keys exist (`coerceToolInput` fills synonym keys with `undefined`). Per-tool path/pattern validation follows: read/write/edit require a non-empty path; glob/grep require a pattern. Dropped broken blocks hand off to intent synthesis, which can pick a file from prior `tool_result` context instead of propagating a Zod-validation failure into the client.
+- **`isBogusBashCommand`** drops Bash calls whose command is just a tool name (`bash`, `read`, `context`, `timeout`, `xargs`, `sudo`, `env`, `exec`, `source`, `message`, `parameters`, …) or an orphan CLI flag (`:message=...`, `-message=...`, `--param=...`). These produce `exit 127` / `missing operand` and break the agent loop.
+- **`isContentFilenameMismatch`** drops Write calls where the content's first-line filename heading (`# FILENAME.ext`, HTML comment, JS/C comment) refers to a different file than `file_path`. This prevents catastrophic overwrites (e.g., model emitting `Write(manifest.json, '# CLAUDE.md\n...')`).
+- **Empty `content` Write** is also dropped — it would otherwise truncate an existing file to zero bytes.
+- **Schema shape sync for read/write/edit.** `coerceToolInput` populates every synonym of a path field (`file_path`, `filePath`, `path`). Different clients validate differently — OpenCode Zod wants `filePath`, Claude Code uses `file_path`. Without sync the assistant loops on validation errors. The sole exception is `content` for Write — that's the file body, not a path.
+- **Structured OpenAI `tool_calls`** are parsed, canonicalized (same path as text-embedded calls — field sync, sanitization), and re-stringified. This lets weak models emit structured JSON and still be OpenCode-compatible.
+- **Parallel tool-call collapse.** `collapseParallelToolCalls` keeps only the first call per STATEFUL tool per turn (bash, delete, write, edit). Stateless tools (read, glob, grep, webfetch, task) are preserved. Also collapses duplicate `Glob`/`Grep` calls with identical pattern. Disable via `COLLAPSE_PARALLEL_TOOL_CALLS=0`.
+- **Read loop suppression across ALL prior turns** (`suppressRepeatedReadToolCalls`). Weak models sometimes re-emit `Read AGENTS.md` in turns 1, 3, 5, 7 thinking the file came back empty each time. `collectAllPreviousReadTargets` scans the whole history; any Read of a file already read in any earlier turn is dropped so intent synthesis has to pick a different file.
+- **`Bash(cat X)` / `head` / `less` / `more` / `type` / `Get-Content` → Read rewrite.** `extractPathFromReadLikeCommand` detects a simple single-file read command (no pipe, redirect, or extra operators) and rewrites it to the client's Read tool, avoiding `stdout` truncation on large files. Pipes or redirects (`cat X | head`) are left alone.
+- **Leading stray prefixes** in bash (`_ cat x`, `. foo`, `: foo`) are stripped; parenthesized wrappers (`(cat x)`) are unwrapped when balanced.
+
+### Intent synthesis (`lib/intent-synthesis.js`)
+
+Deterministic, language-agnostic. Runs only when upstream produced zero tool_use blocks. Order (first hit wins):
+
+1. **Tool-result continuation** (`trySynthesizeReadFromToolResult`) — prior turn had Bash/Glob/Grep output containing filenames; pick the highest-priority unread file (scored via `KEY_FILE_PRIORITY`) and Read it. This is the safest synthesis since Read is stateless.
+2. **Write** — requires (a) the user message has an explicit filename (`index.html`, `config.json`) and (b) a fenced code block that is NOT a path listing, NOT shell output, NOT inside a `<details>`/`<summary>` render container. Any of those → skip synthesis. This guards against turning `ls` output into file content.
+3. **Read** — model text mentions exactly ONE filename, not yet read in any prior turn.
+4. **List/Glob fallback** — session has no prior tool_use yet, user text is non-trivial (>2 chars), no explicit filename in user text. Then synthesize `Glob('**/*')`. This prevents stalls when the model replies with text only on the first turn. Slash-commands like `/init`, `/explore`, `/analyze` (even wrapped in `<command-name>`) match here.
+
+Schema field names are picked from the client's declared tool schema (`file_path` vs `filePath` vs `path`). Disable everything via `SYNTHESIZE_INTENT=0`.
+
+Instrumentation tags in the user message (`<system-reminder>`, `<tool-output>`, `<claude-instructions>`, `<local-command-std*>`) are stripped before intent analysis so that filenames mentioned inside tool manifests don't poison the "user mentioned a specific file" heuristic. Tags that carry the user's real command (`<command-name>`, `<command-args>`, `<command-message>`) have their tag wrapper stripped but inner content kept.
+
+### Misc
+
+- **Post-Write duplicate suppression** — if the previous assistant turn did `Write(X, content)` and the current turn's text contains the same content in a fenced block, it's stripped (model restating what it already wrote causes UIs to render the file body twice).
+- When the normalizer empties `content` that originally had blocks, `server.js` logs `normalization_emptied_content` with truncated raw blocks. Canary — if it fires in a new test, the normalizer is eating legitimate output.
+- If upstream returned `stop_reason: "tool_use"` but normalizer dropped all tool_use blocks, `applyAnthropicNormalization` downgrades stop_reason to `end_turn` to avoid Anthropic "parallel tool error" loops.
 
 ## Testing conventions
 
-- `test/server.test.js` sets `process.env.AIRFORCE_API_KEY` **before** importing `server.js` (top-level `await import`). Preserve that pattern if adding tests that read env at module load.
-- No mocking framework; tests are pure `node:assert/strict`. Don't add a test runner dependency.
-- `test/normalizers.test.js` has ~50 cases; add new scenarios alongside the closest existing block rather than a new file.
+- `test/server.test.js` sets `process.env.AIRFORCE_API_KEY` **before** `await import('...server.js')`. Preserve that pattern for any test that reads env at module load.
+- No mocking framework; pure `node:assert/strict`. Don't add a test runner dependency.
+- ~120 cases in `test/normalizers.test.js`. Add new scenarios alongside the closest existing block rather than starting a new file.
+- Many tests assert exact text content/trimming — changing whitespace in normalization breaks them like snapshots.
 
 ## Deployment
 
-- `deploy/airforce-compat-proxy.service` is an example systemd unit assuming `/root/airforce` + `/etc/airforce-compat-proxy.env`. It's a template — adjust paths for your server. Runtime code itself has no hardcoded paths.
+`deploy/airforce-compat-proxy.service` is an example systemd unit assuming `/root/airforce` + `/etc/airforce-compat-proxy.env`. Template — adjust for your server. Runtime code has no hardcoded paths.
 
 ## Style
 
 - Match existing code: ES modules, single quotes, 2-space indent, named exports. No Prettier config — follow the surrounding file.
-- Keep runtime dependency-free. Anything new should use `node:` built-ins.
+- Keep runtime dependency-free. Anything new uses `node:` built-ins.
+- Comments in `lib/` are often Turkish (original author). Not a policy — write English or Turkish, match the surrounding file.
