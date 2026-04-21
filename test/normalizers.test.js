@@ -183,6 +183,14 @@ test('extractPseudoToolCalls strips standalone filesystem marker lines around no
   assert.equal(parsed.toolCalls.length, 0);
 });
 
+test('extractPseudoToolCalls drops repeated bare tool_use markers instead of inventing a tool_use tool', () => {
+  const parsed = extractPseudoToolCalls('tool_use>tool_use>tool_use>\ntool_use\nRead C:\\Users\\ALICOMERT\\Documents\\PROJELER\\airforce\\package.json');
+  assert.equal(parsed.text, '');
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'Read');
+  assert.equal(parsed.toolCalls[0].input.value, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\airforce\\package.json');
+});
+
 test('applyOpenAiChatNormalization remaps loose read line into filePath', () => {
   const payload = applyOpenAiChatNormalization({
     id: 'chatcmpl_4',
@@ -973,6 +981,211 @@ test('applyAnthropicNormalization parses plain Write filename lines into tool_us
   assert.equal(toolBlock.input.file_path, 'C:\\Users\\ALICOMERT\\Documents\\PROJELER\\kariyer\\CLAUDE.md');
 });
 
+test('extractPseudoToolCalls ignores generic Write file placeholder and bare Agent label', () => {
+  const parsed = extractPseudoToolCalls([
+    'Write file',
+    'Agent:',
+    'Read c:\\Users\\ALICOMERT\\Documents\\PROJELER\\airforce\\README.md'
+  ].join('\n'));
+
+  assert.equal(parsed.toolCalls.length, 1);
+  assert.equal(parsed.toolCalls[0].name, 'Read');
+  assert.equal(parsed.toolCalls[0].input.value, 'c:\\Users\\ALICOMERT\\Documents\\PROJELER\\airforce\\README.md');
+});
+
+test('applyAnthropicNormalization drops bogus ReadFile marker reads while preserving real reads', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bogus_readfile_marker',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: [
+        'Read c:\\Users\\ALICOMERT\\Documents\\PROJELER\\airforce\\package.json',
+        'Read CLAUDE.md',
+        'Read ReadFile>',
+        'Read ReadFile>'
+      ].join('\n')
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 2);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'c:\\Users\\ALICOMERT\\Documents\\PROJELER\\airforce\\package.json');
+  assert.equal(toolBlocks[1].name, 'Read');
+  assert.equal(toolBlocks[1].input.file_path, 'CLAUDE.md');
+});
+
+test('applyAnthropicNormalization drops bogus Plaintext tool_use blocks', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_plaintext_bogus',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'Now let me read the remaining files:' },
+      { type: 'tool_use', id: 'toolu_plaintext', name: 'Plaintext', input: {} }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.some((block) => block.type === 'tool_use'), false);
+  assert.match(payload.content[0].text, /remaining files/i);
+});
+
+test('applyAnthropicNormalization drops unknown tool names not present in client registry', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_unknown_tool',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'Now let me read the remaining files:' },
+      { type: 'tool_use', id: 'toolu_unknown', name: 'NilCommand', input: { foo: 'bar' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }]
+  });
+
+  assert.equal(payload.stop_reason, 'end_turn');
+  assert.equal(payload.content.some((block) => block.type === 'tool_use'), false);
+});
+
+test('applyAnthropicNormalization remaps bash cat command into Read tool_use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_cat_to_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_bash_cat', name: 'Bash', input: { command: 'cat CLAUDE.md' } }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'CLAUDE.md');
+});
+
+test('applyAnthropicNormalization remaps xml-wrapped bash cat command into Read tool_use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_cat_xml_to_read',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_bash_cat_xml', name: 'Bash', input: { command: '<command>cat manifest.json</command>' } }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'manifest.json');
+});
+
+test('applyAnthropicNormalization remaps bash listing command into Glob tool_use', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_bash_find_to_glob',
+    type: 'message',
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'toolu_bash_find', name: 'Bash', input: { command: 'find . -maxdepth 3 -type f | sort' } }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Bash', input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } },
+      { name: 'Glob', input_schema: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Glob');
+  assert.equal(toolBlocks[0].input.pattern, '**/*');
+});
+
+test('applyAnthropicNormalization deduplicates and caps parallel Read tool_use blocks', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_many_reads',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'r1', name: 'Read', input: { file_path: 'a.md' } },
+      { type: 'tool_use', id: 'r2', name: 'Read', input: { file_path: 'b.md' } },
+      { type: 'tool_use', id: 'r3', name: 'Read', input: { file_path: 'a.md' } },
+      { type: 'tool_use', id: 'r4', name: 'Read', input: { file_path: 'c.md' } },
+      { type: 'tool_use', id: 'r5', name: 'Read', input: { file_path: 'd.md' } },
+      { type: 'tool_use', id: 'r6', name: 'Read', input: { file_path: 'e.md' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{ name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 4);
+  assert.deepEqual(toolBlocks.map((b) => b.input.file_path), ['a.md', 'b.md', 'c.md', 'd.md']);
+});
+
+test('applyAnthropicNormalization attaches fenced text content to preceding Write path tool call', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_write_path_then_code',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Write CLAUDE.md\n```md\n# CLAUDE.md\n\nRepo guidance.\n```'
+    }],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: {
+          file_path: { type: 'string' },
+          content: { type: 'string' }
+        },
+        required: ['file_path', 'content']
+      }
+    }]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Write');
+  assert.equal(toolBlocks[0].input.file_path, 'CLAUDE.md');
+  assert.match(toolBlocks[0].input.content, /# CLAUDE\.md/);
+});
+
 test('applyOpenAiChatNormalization coerces generic write path and text fields', () => {
   const payload = applyOpenAiChatNormalization({
     id: 'chatcmpl_write_generic',
@@ -1459,6 +1672,103 @@ test('intent synthesis: single file read intent → synthesizes Read tool with t
   assert.equal(toolBlocks.length, 1);
   assert.equal(toolBlocks[0].name, 'Read');
   assert.equal(toolBlocks[0].input.file_path, 'package.json');
+});
+
+test('intent synthesis: after exploration tool_result, synthesizes Read for key discovered file', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_followup_read_after_glob',
+    type: 'message',
+    role: 'assistant',
+    content: [],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [
+      {
+        name: 'Glob',
+        input_schema: {
+          type: 'object',
+          properties: { pattern: { type: 'string' } },
+          required: ['pattern']
+        }
+      },
+      {
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path']
+        }
+      }
+    ],
+    messages: [
+      { role: 'user', content: '<command-name>/init</command-name>\nPlease analyze this codebase' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: "I'll start by exploring the codebase structure and key files." },
+          { type: 'tool_use', id: 'toolu_glob', name: 'Glob', input: { pattern: '**/*' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_glob',
+            content: 'src/index.js\nREADME.md\nAGENTS.md\npackage.json\nlib/normalizers.js'
+          }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((b) => b.type === 'tool_use');
+  assert.equal(payload.stop_reason, 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'AGENTS.md');
+});
+
+test('applyAnthropicNormalization suppresses repeated Read loop after prior read tool_result', () => {
+  const payload = applyAnthropicNormalization({
+    id: 'msg_repeat_read_loop',
+    type: 'message',
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'toolu_read_repeat_a', name: 'Read', input: { file_path: 'AGENTS.md' } },
+      { type: 'tool_use', id: 'toolu_read_repeat_b', name: 'Read', input: { file_path: 'README.md' } },
+      { type: 'tool_use', id: 'toolu_read_repeat_c', name: 'Read', input: { file_path: 'package.json' } },
+      { type: 'tool_use', id: 'toolu_read_repeat_d', name: 'Read', input: { file_path: 'CLAUDE.md' } }
+    ],
+    stop_reason: 'tool_use'
+  }, {
+    tools: [
+      { name: 'Read', input_schema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } }
+    ],
+    messages: [
+      {
+        role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_prev_read', name: 'Read', input: { file_path: 'AGENTS.md' } }
+        ]
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_prev_read',
+            content: '# AGENTS.md\n\nrepo instructions'
+          }
+        ]
+      }
+    ]
+  });
+
+  const toolBlocks = payload.content.filter((block) => block.type === 'tool_use');
+  assert.equal(toolBlocks.length, 1);
+  assert.equal(toolBlocks[0].name, 'Read');
+  assert.equal(toolBlocks[0].input.file_path, 'README.md');
 });
 
 test('intent synthesis: plain chitchat (no code, no intent) → no synthesis', () => {

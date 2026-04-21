@@ -36,7 +36,7 @@ const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_M
 // Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
 // Default: 1 retry (asil + 1 tekrar). 3 retry * backoff cok uzun surelere yol aciyor.
 const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
-const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 1));
+const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 3));
 
 function parseAliases(raw) {
   if (!raw) {
@@ -183,6 +183,39 @@ function isEffectivelyEmpty(pathname, payload) {
     });
   }
   return false;
+}
+
+const NO_PROGRESS_TEXT_RE = /\b(let me (?:first |just |quickly )?(?:check|see|look|explore|analy[sz]e|examine|understand|read|review|inspect)|i(?:'|’)ll (?:first |now |start|begin)?\s*(?:check|look|explore|analy[sz]e|examine|understand|read|review|inspect)|going to (?:check|look|explore|analy[sz]e|examine|understand|read|review|inspect)|exploring the codebase|checking the repository|reading the files|let me explore the full codebase|let me explore the codebase properly)\b/i;
+
+export function isNoProgressAssistantTurn(pathname, payload) {
+  if (!payload || typeof payload !== 'object') {
+    return true;
+  }
+  if (isEffectivelyEmpty(pathname, payload)) {
+    return true;
+  }
+  if (!(pathname.includes('/anthropic/') || pathname === '/v1/messages')) {
+    return false;
+  }
+  if (!Array.isArray(payload.content) || payload.content.length === 0) {
+    return true;
+  }
+  const hasToolUse = payload.content.some((b) => b?.type === 'tool_use');
+  const hasThinking = payload.content.some((b) => b?.type === 'thinking' && typeof b?.thinking === 'string' && b.thinking.trim());
+  if (hasToolUse || hasThinking) {
+    return false;
+  }
+  const textBlocks = payload.content
+    .filter((b) => b?.type === 'text' && typeof b?.text === 'string')
+    .map((b) => b.text.trim())
+    .filter(Boolean);
+  if (textBlocks.length === 0) {
+    return true;
+  }
+  if (textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE)) {
+    return true;
+  }
+  return textBlocks.every((text) => NO_PROGRESS_TEXT_RE.test(text));
 }
 
 // Model bos cevap atmis ve retry'lar da bosa cikmissa, sessizce bos
@@ -403,18 +436,20 @@ const server = http.createServer(async (req, res) => {
       payload = restorePresentedModel(parsedBody, payload);
 
       const effectivelyEmpty = isEffectivelyEmpty(requestUrl.pathname, payload);
-      lastWasEmpty = effectivelyEmpty;
+      const noProgress = isNoProgressAssistantTurn(requestUrl.pathname, payload);
+      lastWasEmpty = noProgress;
 
       // Basarili response ama normalize sonrasi bomboss → bir daha cagir
       if (
         upstreamResponse.status >= 200 && upstreamResponse.status < 300 &&
         RETRY_ON_EMPTY_RESPONSE &&
         emptyAttempt < maxEmptyRetries &&
-        effectivelyEmpty
+        noProgress
       ) {
         logDebug('upstream_empty_payload_retry', {
           attempt: emptyAttempt + 1,
           path: requestUrl.pathname,
+          reason: effectivelyEmpty ? 'empty' : 'no_progress',
           raw_content_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.content) ? rawPayload.content.length : undefined,
           raw_choices_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.choices) ? rawPayload.choices.length : undefined
         });
