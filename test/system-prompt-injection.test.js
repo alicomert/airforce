@@ -226,15 +226,59 @@ test('injectSystemPromptForPath returns body unchanged for unknown path', () => 
   assert.equal(out.system, undefined);
 });
 
-test('contract suggests (not forces) tool calls and allows plain text', () => {
-  // Contract'in core mesaji: "aksiyon varsa tool call tercih et, ama text de ok".
-  // Rigid "MUST" dayatma yok - model bilmedigi konularda sikismadan text/soru ile
-  // cevap verebilsin. Asiri sikistirma bos cevaplara yol aciyordu.
+test('contract enforces file-mutation tool calls and allows clarifying questions', () => {
+  // Contract now uses "MUST" for filesystem actions because weak models
+  // (glm-5) habitually print fenced code instead of calling Write. The
+  // stronger wording reduced "I created X" false completions. But model
+  // can still ask clarifying questions when genuinely unsure.
   const contract = buildToolContract({ tools: claudeCodeTools });
   assert.ok(contract);
-  assert.match(contract, /prefer/i);
-  // "MUST" kelimesi gecmemeli (son ton degisikligi)
-  assert.doesNotMatch(contract, /\bMUST\b/);
-  // Model istedigi zaman plain text / clarifying question atabilsin mesajini dahil
+  // File mutation tools must use MUST language
+  assert.match(contract, /MUST/);
+  assert.match(contract, /invoke/i);
+  // Model can ask for clarification when needed
   assert.match(contract, /clarifying|ask|question/i);
+});
+
+test('buildToolContract includes session checkpoint on long conversations', () => {
+  // After 8+ assistant turns, a "session checkpoint" hint is added to the
+  // contract reminding the model what tools were used and not to hallucinate
+  // filenames. Helps weak models like glm-5 stay grounded in long sessions.
+  const longSession = {
+    tools: claudeCodeTools,
+    messages: [
+      { role: 'user', content: 'start' },
+      ...Array.from({ length: 9 }, (_, i) => ({
+        role: i % 2 === 0 ? 'assistant' : 'user',
+        content: i % 2 === 0
+          ? [{ type: 'tool_use', id: `t${i}`, name: i < 4 ? 'Read' : 'Bash', input: i < 4 ? { file_path: `file${i}.md` } : { command: 'ls' } }]
+          : [{ type: 'tool_result', tool_use_id: `t${i - 1}`, content: 'result' }]
+      }))
+    ]
+  };
+
+  const contract = buildToolContract(longSession);
+  assert.ok(contract);
+  assert.match(contract, /Session checkpoint/i);
+  // Should list tool usage stats
+  assert.match(contract, /Readx|Bashx/);
+  // Should warn against invented filenames
+  assert.match(contract, /DO NOT invent/);
+  // Should list already-read files
+  assert.match(contract, /file0\.md|file2\.md/);
+});
+
+test('buildToolContract does NOT include session checkpoint on short sessions (under 8 turns)', () => {
+  const shortSession = {
+    tools: claudeCodeTools,
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] }
+    ]
+  };
+
+  const contract = buildToolContract(shortSession);
+  assert.ok(contract);
+  assert.doesNotMatch(contract, /Session checkpoint/i);
 });
