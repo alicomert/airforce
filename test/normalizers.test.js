@@ -3150,6 +3150,242 @@ test('strips <thinking> chain-of-thought tag like <think>', () => {
   assert.ok(textBlock.text.includes('Here is my answer.'), 'real answer preserved');
 });
 
+test('strips model-agnostic reasoning tags: <reasoning>, <scratchpad>, <planning>, <rationale>', () => {
+  // Model-agnostic CoT cleanup: any non-HTML balanced tag block gets stripped.
+  // This way GPT-3.5, Llama, Mistral, DeepSeek, Gemini all work without
+  // needing a hardcoded list.
+  const cases = [
+    { tag: 'reasoning', hidden: 'I should plan first' },
+    { tag: 'scratchpad', hidden: 'intermediate work here' },
+    { tag: 'planning', hidden: 'step 1 step 2' },
+    { tag: 'rationale', hidden: 'because of X' },
+    { tag: 'monologue', hidden: 'thinking out loud' },
+    { tag: 'analysis', hidden: 'breakdown of problem' },
+    { tag: 'deliberation', hidden: 'weighing options' }
+  ];
+
+  for (const { tag, hidden } of cases) {
+    const payload = applyAnthropicNormalization({
+      id: 'msg',
+      type: 'message',
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: `<${tag}>\n${hidden}\n</${tag}>\nFinal answer visible.`
+      }],
+      stop_reason: 'end_turn'
+    });
+
+    const textBlock = payload.content.find((b) => b?.type === 'text');
+    assert.ok(textBlock, `${tag}: text block should exist`);
+    assert.ok(!textBlock.text.includes(`<${tag}>`), `${tag}: opening tag stripped`);
+    assert.ok(!textBlock.text.includes(hidden), `${tag}: inner content hidden`);
+    assert.ok(textBlock.text.includes('Final answer visible.'), `${tag}: real answer preserved`);
+  }
+});
+
+test('preserves legitimate HTML tags (<div>, <p>, <code>, <pre>, <ul>, <table>)', () => {
+  // Counter-test: ensure HTML tags we want users to see are NOT stripped.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: '<div>Hello</div>\n<p>Paragraph</p>\n<ul><li>Item</li></ul>\n<code>var x = 1;</code>\n<pre>preformatted</pre>\n<table><tr><td>cell</td></tr></table>'
+    }],
+    stop_reason: 'end_turn'
+  });
+
+  const textBlock = payload.content.find((b) => b?.type === 'text');
+  assert.ok(textBlock);
+  assert.ok(textBlock.text.includes('<div>'), 'HTML <div> preserved');
+  assert.ok(textBlock.text.includes('<p>'), 'HTML <p> preserved');
+  assert.ok(textBlock.text.includes('<ul>'), 'HTML <ul> preserved');
+  assert.ok(textBlock.text.includes('<code>'), 'HTML <code> preserved');
+  assert.ok(textBlock.text.includes('<pre>'), 'HTML <pre> preserved');
+  assert.ok(textBlock.text.includes('<table>'), 'HTML <table> preserved');
+});
+
+test('malformed completion detection works for ANY non-HTML stray close tag (model-agnostic)', () => {
+  // Critical: GPT-3.5 might stray </answer>, Llama might stray </response>,
+  // DeepSeek might stray </rationale>. All should be detected as malformed
+  // without needing a hardcoded list.
+  const strayTags = ['</answer>', '</rationale>', '</response>', '</planning>', '</scratchpad>', '</output>'];
+
+  for (const strayTag of strayTags) {
+    const payload = applyAnthropicNormalization({
+      id: 'msg',
+      type: 'message',
+      role: 'assistant',
+      content: [{
+        type: 'text',
+        text: `I will create the file.${strayTag}\n\nCreated successfully.`
+      }],
+      stop_reason: 'end_turn'
+    }, {
+      tools: [{
+        name: 'Write',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+          required: ['file_path', 'content']
+        }
+      }, {
+        name: 'Read',
+        input_schema: {
+          type: 'object',
+          properties: { file_path: { type: 'string' } },
+          required: ['file_path']
+        }
+      }],
+      messages: [
+        { role: 'user', content: 'create a file' },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] },
+        { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'b.md' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'y' }] }
+      ]
+    });
+
+    const textBlocks = payload.content.filter((b) => b?.type === 'text');
+    assert.ok(textBlocks.length > 0, `${strayTag}: text returned`);
+    assert.ok(
+      textBlocks[0].text.includes('malformed completion'),
+      `${strayTag}: should be detected as malformed completion (model-agnostic)`
+    );
+  }
+});
+
+test('does NOT treat stray </div> (legit HTML) as malformed', () => {
+  // Counter-test: stray </div> is normal HTML fragment, not a reasoning tag.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Here is some HTML fragment: hello</div>'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'explain' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'a.md' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'x' }] },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'b.md' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'y' }] }
+    ]
+  });
+
+  const textBlocks = payload.content.filter((b) => b?.type === 'text');
+  assert.ok(textBlocks[0].text.includes('HTML fragment'));
+  assert.ok(!textBlocks[0].text.includes('malformed'), 'legit HTML stray tag should not trigger error');
+});
+
+test('model claims completion with unclosed </think> but no tool_use -> returns clear error to user', () => {
+  // Real log regression: model said "Created CLAUDE.md...</think>..." with
+  // end_turn and NO tool_use. Prior turns had many reads. Model reports
+  // completion but never actually did Write. Proxy must not stall or let
+  // accidental file writes happen - return a clear error message.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'I need to use the Write tool properly. Let me create the file.</think>\n\nCreated CLAUDE.md with project overview.'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Write',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' }, content: { type: 'string' } },
+        required: ['file_path', 'content']
+      }
+    }, {
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }],
+    messages: [
+      { role: 'user', content: '/init' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'AGENTS.md' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'content' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'package.json' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'content' }] }
+    ]
+  });
+
+  const textBlocks = payload.content.filter((b) => b?.type === 'text');
+  assert.equal(textBlocks.length, 1);
+  assert.ok(textBlocks[0].text.includes('malformed completion'), 'should return malformed completion error');
+  assert.equal(payload.stop_reason, 'end_turn');
+  // NO tool_use injected (safe)
+  assert.equal(payload.content.filter((b) => b?.type === 'tool_use').length, 0);
+});
+
+test('well-formed end_turn with prior tool_use passes through without error wrapping', () => {
+  // Counter-test: model legitimately ended with end_turn + final summary text
+  // (no stray tags). Proxy must NOT wrap this in an error.
+  const payload = applyAnthropicNormalization({
+    id: 'msg',
+    type: 'message',
+    role: 'assistant',
+    content: [{
+      type: 'text',
+      text: 'Done! I have finished the analysis.'
+    }],
+    stop_reason: 'end_turn'
+  }, {
+    tools: [{
+      name: 'Read',
+      input_schema: {
+        type: 'object',
+        properties: { file_path: { type: 'string' } },
+        required: ['file_path']
+      }
+    }],
+    messages: [
+      { role: 'user', content: 'analyze' },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'AGENTS.md' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'content' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 't2', name: 'Read', input: { file_path: 'package.json' } }]
+      },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't2', content: 'content' }] }
+    ]
+  });
+
+  const textBlocks = payload.content.filter((b) => b?.type === 'text');
+  assert.equal(textBlocks.length, 1);
+  assert.ok(!textBlocks[0].text.includes('malformed'), 'well-formed end_turn should NOT be wrapped in error');
+  assert.ok(textBlocks[0].text.includes('Done!'), 'original text preserved');
+});
+
 test('model returns only text on first turn -> proxy synthesizes Glob fallback (no stall)', () => {
   // Critical regression: user asked anything, model returned just text
   // "I'll start by exploring..." with stop_reason: end_turn, no tool_use.
