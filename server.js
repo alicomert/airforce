@@ -48,14 +48,24 @@ const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_M
 // bolumune temporary bir hint eklenir. Bu, zayif modelleri (glm-5 vb.) tool
 // kullanmaya ittirir ve kullanicinin "sistem durdu" deneyimini onler.
 //
-// Butce: toplam `EMPTY_RESPONSE_BUDGET_MS` (default FAST_MODE'da 60s, normal
-// 120s) boyunca retry devam eder. Tek upstream cagri timeout'u (UPSTREAM_
-// TIMEOUT_MS) bundan bagimsizdir. Safety net olarak 10 retry hard limit var
-// - upstream cok hizli cevap donup bos geliyorsa bile butce kullanici bekleme
-// toleransini asmasin.
+// YENI DEFAULTLAR (daha agresif / daha az bekleme):
+//   - EMPTY_RESPONSE_MAX_RETRIES: 3 (onceden 10). Saglam bir upstream 1-2
+//     retry icinde kendine gelir; gelmiyorsa daha cok beklemek faydasiz.
+//   - EMPTY_RESPONSE_BUDGET_MS: 15s (onceden FAST:60s / normal:120s).
+//     Kullanici bekleme toleransi kritik - 15 saniye '...' gormek maksimum.
+// Eski "sabit bekle, cok dene" davranisi kullanicilarin "model degistir"
+// mesaji gormesine ve 60-120 saniye bekleyip yine de bos donus almasina
+// sebep oluyordu. Istisna: son mesaj bir tool hatasi (File not found, error,
+// permission denied) ise retry TAMAMEN atlanir - upstream ayni hata sonucu
+// gorerek dogru cevap uretemiyor, retry sadece bekletir; hemen fallback text
+// ile donelim ki client (OpenCode/Claude Code) tekrar denesin.
 const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
-const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 10));
-const EMPTY_RESPONSE_BUDGET_MS = Math.max(5000, Number(process.env.EMPTY_RESPONSE_BUDGET_MS || (FAST_MODE ? 60000 : 120000)));
+const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 3));
+const EMPTY_RESPONSE_BUDGET_MS = Math.max(3000, Number(process.env.EMPTY_RESPONSE_BUDGET_MS || 15000));
+// Son tool_result hata mesaji mi? (File not found / permission denied / error:)
+// Bu durumda empty-retry anlamsiz - upstream ayni hatayi tekrar tekrar
+// gormekten cevap uretemez. Client'in hatayi gorup tekrar denemesi gerek.
+const SKIP_EMPTY_RETRY_ON_TOOL_ERROR = process.env.SKIP_EMPTY_RETRY_ON_TOOL_ERROR !== '0';
 
 function parseAliases(raw) {
   if (!raw) {
@@ -420,16 +430,90 @@ function collectPriorToolCategories(parsedBody) {
     glob: 'list', listdirectory: 'list', list_directory: 'list', findfiles: 'list',
     grep: 'grep', search: 'grep', ripgrep: 'grep', contentsearch: 'grep'
   };
+  const addName = (rawName) => {
+    const name = String(rawName ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const cat = categoryMap[name];
+    if (cat) categories.add(cat);
+  };
   for (const msg of messages) {
-    if (msg?.role !== 'assistant' || !Array.isArray(msg?.content)) continue;
-    for (const block of msg.content) {
-      if (block?.type !== 'tool_use') continue;
-      const name = String(block?.name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      const cat = categoryMap[name];
-      if (cat) categories.add(cat);
+    if (msg?.role !== 'assistant') continue;
+    // Anthropic format: content[].tool_use
+    if (Array.isArray(msg.content)) {
+      for (const block of msg.content) {
+        if (block?.type === 'tool_use') addName(block?.name);
+      }
+    }
+    // OpenAI Chat format: tool_calls[].function.name
+    if (Array.isArray(msg.tool_calls)) {
+      for (const tc of msg.tool_calls) {
+        addName(tc?.function?.name ?? tc?.name);
+      }
     }
   }
   return categories;
+}
+
+// Son tool_result bir hata mesaji iceriyor mu? Iki formati da destekler:
+//   Anthropic: user.content[] icinde { type: 'tool_result', is_error: true } VEYA
+//              content stringinde File not found / permission denied / error:
+//   OpenAI Chat: { role: 'tool', content: '<string>' }
+//
+// Kullanim: empty payload retry atlanmasi icin sinyal. Upstream, son turda
+// 'File not found' gorurse cogu zaman cevap uretemiyor; biz 3+ kere daha
+// bos deneyeceğimize hemen kullaniciya text fallback donelim, client
+// (OpenCode/Claude Code) hatayi gorup kendi dogru path'i bulsun.
+export function isLastToolResultAnError(parsedBody) {
+  const messages = Array.isArray(parsedBody?.messages) ? parsedBody.messages : [];
+  const ERROR_PATTERNS = [
+    /\bfile not found\b/i,
+    /\bno such file\b/i,
+    /\bpermission denied\b/i,
+    /\bnot found:/i,
+    /\benoent\b/i,
+    /\bEPERM\b/,
+    /\berror:/i,
+    /\bfailed:/i,
+    /\bcannot (?:read|write|access|find|open)\b/i
+  ];
+  const textLooksLikeError = (text) => {
+    if (typeof text !== 'string') return false;
+    // Kisa text'te aramayalim - false positive riski. Uzun prose'da 'error:'
+    // kelimesi gecebilir.
+    const trimmed = text.trim();
+    if (trimmed.length < 4) return false;
+    if (trimmed.length > 2000) return false; // buyuk dosya icerikleri hata degil
+    return ERROR_PATTERNS.some((re) => re.test(trimmed));
+  };
+  // En son tool_result mesajini bul
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const msg = messages[i];
+    if (!msg) continue;
+    // OpenAI Chat: role === 'tool'
+    if (msg.role === 'tool') {
+      const content = typeof msg.content === 'string'
+        ? msg.content
+        : (Array.isArray(msg.content) ? msg.content.map((b) => (typeof b === 'string' ? b : b?.text ?? '')).join('\n') : '');
+      return textLooksLikeError(content);
+    }
+    // Anthropic: user.content[].tool_result
+    if (msg.role === 'user' && Array.isArray(msg.content)) {
+      const toolResultBlocks = msg.content.filter((b) => b?.type === 'tool_result');
+      if (toolResultBlocks.length === 0) continue;
+      // is_error flag? (Anthropic spec)
+      if (toolResultBlocks.some((b) => b.is_error === true)) return true;
+      // Text icerigi hata pattern'i iceriyor mu?
+      for (const block of toolResultBlocks) {
+        const text = typeof block.content === 'string'
+          ? block.content
+          : (Array.isArray(block.content) ? block.content.map((c) => (typeof c === 'string' ? c : c?.text ?? '')).join('\n') : '');
+        if (textLooksLikeError(text)) return true;
+      }
+      return false;
+    }
+    // Assistant mesaji geldiyse (tool_result yok), bu turda zaten tool_result olmamis
+    if (msg.role === 'assistant') return false;
+  }
+  return false;
 }
 
 // Upstream'e fetch + timeout + retry. Network hatasi, 5xx, 408/425/429'da otomatik yeniden dener.
@@ -606,9 +690,21 @@ const server = http.createServer(async (req, res) => {
     // ulastiginda durur (EMPTY_RESPONSE_BUDGET_MS butcesi kullanici bekleme
     // toleransini asmaz). Conversation state DEGISMEZ - sadece request body'nin
     // system bolumune gecici bir nudge eklenir.
-    const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? EMPTY_RESPONSE_MAX_RETRIES : 0;
+    // Son tool_result bir hata sonucu mu? Oyleyse retry ANLAMSIZ: upstream
+    // ayni hata sonucu gormekten cevap uretemiyor, biz kullaniciyi bekletmeyelim.
+    // Hemen fallback text'e dusulur ve client hatayi gorup dogru yol deneyebilir.
+    const priorToolResultWasError = SKIP_EMPTY_RETRY_ON_TOOL_ERROR && isLastToolResultAnError(parsedBody);
+    const effectiveMaxRetries = priorToolResultWasError ? 0 : EMPTY_RESPONSE_MAX_RETRIES;
+    const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? effectiveMaxRetries : 0;
     const emptyRetryDeadline = Date.now() + EMPTY_RESPONSE_BUDGET_MS;
     const priorToolCategories = collectPriorToolCategories(parsedBody);
+
+    if (priorToolResultWasError && RETRY_ON_EMPTY_RESPONSE) {
+      logDebug('empty_retry_skipped_tool_error', {
+        path: requestUrl.pathname,
+        reason: 'last tool_result matched error pattern; retry would loop on same error'
+      });
+    }
 
     let upstreamResponse;
     let contentType = '';
@@ -803,6 +899,6 @@ if (isMainModule) {
   server.listen(PORT, HOST, () => {
     console.log(`Airforce compat proxy listening on http://${HOST}:${PORT}`);
     console.log(`Upstream: ${UPSTREAM_BASE_URL}`);
-    console.log(`FAST_MODE: ${FAST_MODE ? 'on' : 'off'} | attempts=${UPSTREAM_MAX_ATTEMPTS} empty_retries=${EMPTY_RESPONSE_MAX_RETRIES} timeout=${UPSTREAM_TIMEOUT_MS}ms`);
+    console.log(`FAST_MODE: ${FAST_MODE ? 'on' : 'off'} | attempts=${UPSTREAM_MAX_ATTEMPTS} empty_retries=${EMPTY_RESPONSE_MAX_RETRIES} (budget ${EMPTY_RESPONSE_BUDGET_MS}ms${SKIP_EMPTY_RETRY_ON_TOOL_ERROR ? ', skip-on-tool-error' : ''}) timeout=${UPSTREAM_TIMEOUT_MS}ms`);
   });
 }

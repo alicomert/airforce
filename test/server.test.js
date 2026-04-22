@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 
 process.env.AIRFORCE_API_KEY = 'sk-air-test';
 
-const { buildUpstreamHeaders, isNoProgressAssistantTurn, shouldHandleSyntheticStream } = await import('../server.js');
+const { buildUpstreamHeaders, isNoProgressAssistantTurn, shouldHandleSyntheticStream, isLastToolResultAnError } = await import('../server.js');
 
 test('buildUpstreamHeaders overrides inbound auth headers with configured upstream key', () => {
   const headers = buildUpstreamHeaders({
@@ -95,4 +95,73 @@ test('isNoProgressAssistantTurn: completely empty payload is retryable', () => {
   assert.equal(isNoProgressAssistantTurn('/anthropic/v1/messages', {
     content: []
   }, { messages: [{ role: 'user', content: 'hi' }] }), true);
+});
+
+// ---- isLastToolResultAnError: skip empty-retry when upstream can't recover ----
+
+test('isLastToolResultAnError: detects File not found in OpenAI Chat tool message', () => {
+  // Real regression: model called Read(normalizers.js) with wrong path,
+  // tool returned "File not found", upstream then returned empty payloads on
+  // every retry. We should skip retry entirely in this case.
+  assert.equal(isLastToolResultAnError({
+    messages: [
+      { role: 'user', content: 'analyze' },
+      { role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'read', arguments: '{"filePath":"normalizers.js"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: 'File not found: C:\\Users\\x\\normalizers.js' }
+    ]
+  }), true);
+});
+
+test('isLastToolResultAnError: detects is_error flag in Anthropic tool_result', () => {
+  assert.equal(isLastToolResultAnError({
+    messages: [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Read', input: { file_path: 'x.md' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', is_error: true, content: 'anything' }] }
+    ]
+  }), true);
+});
+
+test('isLastToolResultAnError: detects "Error:" text in Anthropic tool_result', () => {
+  assert.equal(isLastToolResultAnError({
+    messages: [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'ls' } }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'Error: permission denied' }] }
+    ]
+  }), true);
+});
+
+test('isLastToolResultAnError: normal successful tool_result is NOT an error', () => {
+  // A Read that successfully returned file contents — should not trigger skip.
+  assert.equal(isLastToolResultAnError({
+    messages: [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'read', arguments: '{"filePath":"a.md"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: '# Heading\n\nSome normal file content that mentions nothing about errors.' }
+    ]
+  }), false);
+});
+
+test('isLastToolResultAnError: huge file content with "error" word is not misclassified', () => {
+  // File contents legitimately containing the word "error" in prose should
+  // not trigger skip. The >2000-char guard handles this.
+  const bigContent = 'a'.repeat(3000) + ' error: this is inside a file, not a tool failure';
+  assert.equal(isLastToolResultAnError({
+    messages: [
+      { role: 'user', content: 'x' },
+      { role: 'assistant', tool_calls: [{ id: 'c1', function: { name: 'read', arguments: '{"filePath":"a.log"}' } }] },
+      { role: 'tool', tool_call_id: 'c1', content: bigContent }
+    ]
+  }), false);
+});
+
+test('isLastToolResultAnError: returns false when last message is not a tool_result', () => {
+  // Last assistant message (no tool result came yet after it) -> not an error state
+  assert.equal(isLastToolResultAnError({
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'ok' }
+    ]
+  }), false);
 });
