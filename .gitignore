@@ -1,0 +1,30 @@
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code / Cursor / other agent CLIs — local session & permission state,
+# not source code. Tracking these causes `git pull` conflicts on every host
+# because each machine's CLI rewrites them at runtime.
+.claude/settings.local.json
+.claude/*.local.json
+.cursor/settings.local.json
+
+# OpenCode local state
+.opencode/
