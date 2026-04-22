@@ -16,6 +16,7 @@ import {
   openAiChatSseFromCompletion
 } from './lib/sse.js';
 import { injectSystemPromptForPath } from './lib/system-prompt-injection.js';
+import { buildAutoRecoveryPayload, AUTO_RECOVERY_ENABLED } from './lib/auto-recovery.js';
 
 const PORT = Number(process.env.PORT || 2393);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -187,6 +188,15 @@ function isRetriableStatus(status) {
   return status === 408 || status === 425 || status === 429 || (status >= 500 && status < 600);
 }
 
+// Legacy empty-response fallback text. Sadece AUTO_RECOVERY=0 +
+// EMPTY_RESPONSE_LEGACY_TEXT=1 iken kullaniciya gosterilir. Normal default'ta
+// auto-recovery devrede oldugu icin bu string HIC basilmaz. isNoProgress
+// guard'i hala bu metni (ve SILENT_PROGRESS_TEXT '.') no-progress olarak
+// tespit edip retry tetiklemeyi engeller (eski session'larda history'de
+// bu metin varsa).
+const LEGACY_EMPTY_MESSAGE = 'The upstream model returned an empty response. Please rephrase the request or try a different model.';
+const EMPTY_RESPONSE_LEGACY_TEXT = process.env.EMPTY_RESPONSE_LEGACY_TEXT === '1';
+
 // Normalize sonrasi cevap gercekten bos mu? Anthropic: content[] tamamen bos/text-empty
 // ve tool_use yok. OpenAI chat: choices bos veya tum choice'larin mesaji bos ve tool_call yok.
 function isEffectivelyEmpty(pathname, payload) {
@@ -262,8 +272,10 @@ export function isNoProgressAssistantTurn(pathname, payload, requestBody) {
   if (textBlocks.length === 0) {
     return true;
   }
-  // Proxy'nin kendi fallback mesaji -> kesinlikle no-progress
-  if (textBlocks.every((text) => text === EMPTY_RESPONSE_USER_MESSAGE)) {
+  // Proxy'nin kendi legacy fallback mesaji -> kesinlikle no-progress
+  // (AUTO_RECOVERY=0 + EMPTY_RESPONSE_LEGACY_TEXT=1 modu; normalde yoksa da
+  //  geriye donuk session'lar icin guard)
+  if (textBlocks.every((text) => text === LEGACY_EMPTY_MESSAGE || text === '.')) {
     return true;
   }
   // Requestbody yoksa risk alma, legit kabul et (geriye donuk uyumluluk).
@@ -314,20 +326,38 @@ export function isNoProgressAssistantTurn(pathname, payload, requestBody) {
   return false;
 }
 
-// Model bos cevap atmis ve retry'lar da bosa cikmissa, sessizce bos
-// response'u donmek yerine kullaniciya problem hakkinda kisa bir aciklama
-// dondur. Boylece Claude Code / OpenCode gibi istemciler asili kalmaz,
-// kullanici ne olduysa gorur ve tekrar dener / model degistirir.
-const EMPTY_RESPONSE_USER_MESSAGE = 'The upstream model returned an empty response. Please rephrase the request or try a different model.';
+// ESKI: Empty payload gelince kullaniciya "The upstream model returned an
+// empty response. Please rephrase the request or try a different model."
+// mesaji gosteriyordu. Bu mesaj artik GOSTERILMIYOR.
+//
+// YENI: Auto-recovery (lib/auto-recovery.js) devreye girer:
+//   1) history'e bakip deterministik bir tool_use sentezler (Read/Glob/Write)
+//   2) sentez imkansizsa minimal bir '.' text + end_turn doner (gorulmez)
+//
+// Boylece kullanici ne "empty response" text'i gorur, ne "model degistir"
+// yazisi. Session canli kalir; client (OpenCode/Claude Code) normal bir
+// cevapla turn'u bitirir, kullanici bir sonraki prompt'u yazar.
+//
+// Auto-recovery'yi kapatmak icin: AUTO_RECOVERY=0 (gereksiz; sadece debugging)
+// Legacy fallback text'e donmek icin: AUTO_RECOVERY=0 + EMPTY_RESPONSE_LEGACY_TEXT=1
+// (LEGACY_EMPTY_MESSAGE ve EMPTY_RESPONSE_LEGACY_TEXT sabitleri yukarida
+//  isNoProgressAssistantTurn'den once tanimli; guard icin orada lazim.)
 
-function injectEmptyResponseFallback(pathname, payload) {
+function injectEmptyResponseFallback(pathname, payload, requestBody) {
+  // Yeni default: auto-recovery
+  if (AUTO_RECOVERY_ENABLED && !EMPTY_RESPONSE_LEGACY_TEXT) {
+    const recovered = buildAutoRecoveryPayload(pathname, requestBody, payload);
+    if (recovered) return recovered;
+  }
+
+  // Legacy path (sadece AUTO_RECOVERY=0 + EMPTY_RESPONSE_LEGACY_TEXT=1 ile):
   if (!payload || typeof payload !== 'object') {
     payload = {};
   }
   if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
     return {
       ...payload,
-      content: [{ type: 'text', text: EMPTY_RESPONSE_USER_MESSAGE }],
+      content: [{ type: 'text', text: LEGACY_EMPTY_MESSAGE }],
       stop_reason: payload.stop_reason && payload.stop_reason !== 'tool_use' ? payload.stop_reason : 'end_turn'
     };
   }
@@ -341,7 +371,7 @@ function injectEmptyResponseFallback(pathname, payload) {
         finish_reason: firstChoice.finish_reason && firstChoice.finish_reason !== 'tool_calls' ? firstChoice.finish_reason : 'stop',
         message: {
           role: 'assistant',
-          content: EMPTY_RESPONSE_USER_MESSAGE
+          content: LEGACY_EMPTY_MESSAGE
         }
       }]
     };
@@ -770,14 +800,26 @@ const server = http.createServer(async (req, res) => {
       break;
     }
 
-    // Retry'lar bitti ve cevap hala bos → sessizce bosa gonderme; kullaniciya
-    // anlamli bir aciklama dondurs ki Claude Code 4+ dakika asili kalmasin.
+    // Retry'lar bitti ve cevap hala bos → AUTO-RECOVERY:
+    // lib/auto-recovery.js deterministik bir tool_use sentezler veya sessiz
+    // bir '.' text doner. Kullanici "empty response / model degistir"
+    // mesajini BIR DAHA GORMEZ. Session canli kalir.
     if (
       !nonJsonPassthrough &&
       lastWasEmpty &&
       upstreamResponse?.status >= 200 && upstreamResponse?.status < 300
     ) {
-      payload = injectEmptyResponseFallback(requestUrl.pathname, payload);
+      const prevPayload = payload;
+      payload = injectEmptyResponseFallback(requestUrl.pathname, payload, parsedBody);
+      if (payload !== prevPayload) {
+        logDebug('auto_recovery_applied', {
+          path: requestUrl.pathname,
+          has_tool_use: Array.isArray(payload?.content)
+            ? payload.content.some((b) => b?.type === 'tool_use')
+            : (Array.isArray(payload?.choices) && payload.choices[0]?.message?.tool_calls?.length > 0),
+          kind: AUTO_RECOVERY_ENABLED && !EMPTY_RESPONSE_LEGACY_TEXT ? 'auto-recovery' : 'legacy-text'
+        });
+      }
     }
 
     if (nonJsonPassthrough) {

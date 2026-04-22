@@ -9,9 +9,10 @@ Compact guide for working in this repo. See `README.md` and `CLAUDE.md` for user
   - `server.js` — HTTP server + routing + upstream retry + keep-alive
   - `lib/normalizers.js` — tool-call / chain-of-thought / XML-ish text normalization (~2700 lines; the bulk of the logic)
   - `lib/intent-synthesis.js` — when upstream answers with plain text instead of `tool_use`, synthesizes a tool call from deterministic signals (tool history, fenced block structure, render containers, explicit filenames, slash-commands). No hardcoded natural-language phrases. Uses the client's declared tool names.
+  - `lib/auto-recovery.js` — **default ON** (`AUTO_RECOVERY=0` to opt out). Handles the "upstream returned completely empty payload" case: synthesizes a deterministic tool_use from history or, if impossible, returns a minimal `.` text so the session keeps moving. Replaces the old "The upstream model returned an empty response..." user-facing error text — that string is **never shown to end users anymore**.
   - `lib/system-prompt-injection.js` — **default ON** (`INJECT_SYSTEM_PROMPT=0` to opt out). Injects a dynamic tool contract (built from the client's tool list + schemas) into the system prompt to nudge weaker models toward calling tools instead of replying in text. Known trade-off: a few weak models emit OpenAI-style `{"name":"X",…}` JSON after seeing signatures, which surfaces as `No such tool available` in Claude Code — disable via env if you hit this.
   - `lib/sse.js` — synthesizes Anthropic & OpenAI SSE streams from a single non-stream upstream JSON reply
-- Tests: `node:test` under `test/`, fixtures under `testdata/`. ~150 cases in `normalizers.test.js` alone; separate `system-prompt-injection.test.js` and `server.test.js` suites.
+- Tests: `node:test` under `test/`, fixtures under `testdata/`. ~150 cases in `normalizers.test.js`; separate `system-prompt-injection.test.js`, `server.test.js`, and `auto-recovery.test.js` suites.
 
 ## Commands
 
