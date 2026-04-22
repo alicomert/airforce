@@ -240,6 +240,32 @@ test('contract enforces file-mutation tool calls and allows clarifying questions
   assert.match(contract, /clarifying|ask|question/i);
 });
 
+test('buildToolContract is skipped when client already provides substantial system prompt', () => {
+  // Strong clients (OpenCode, Claude Code) send their own detailed tool
+  // guidance. Double-injection confuses strong models (Claude Sonnet, GPT-4)
+  // and causes empty responses. Skip when client has >=500 char system.
+  const clientSystem = 'You are OpenCode, an interactive CLI tool. '.repeat(20); // ~800 chars
+
+  // Anthropic format (system as string)
+  const contract1 = buildToolContract({ tools: claudeCodeTools, system: clientSystem });
+  assert.equal(contract1, null, 'Anthropic string system >=500 chars: skip');
+
+  // OpenAI format (system role in messages)
+  const contract2 = buildToolContract({
+    tools: claudeCodeTools,
+    messages: [{ role: 'system', content: clientSystem }, { role: 'user', content: 'hi' }]
+  });
+  assert.equal(contract2, null, 'OpenAI system message >=500 chars: skip');
+});
+
+test('buildToolContract still injects when client has NO or tiny system prompt', () => {
+  const contract1 = buildToolContract({ tools: claudeCodeTools });
+  assert.ok(contract1, 'no system: inject');
+
+  const contract2 = buildToolContract({ tools: claudeCodeTools, system: 'short' });
+  assert.ok(contract2, 'tiny system: inject');
+});
+
 test('buildToolContract includes session checkpoint on long conversations', () => {
   // After 8+ assistant turns, a "session checkpoint" hint is added to the
   // contract reminding the model what tools were used and not to hallucinate

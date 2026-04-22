@@ -7,18 +7,19 @@ Compact guide for working in this repo. See `README.md` and `CLAUDE.md` for user
 - Pure ESM Node.js project (`"type": "module"`). No TypeScript, no bundler, no linter, no formatter. Zero runtime dependencies — anything new must use `node:` built-ins.
 - Source files:
   - `server.js` — HTTP server + routing + upstream retry + keep-alive
-  - `lib/normalizers.js` — tool-call / chain-of-thought / XML-ish text normalization (~2200 lines; the bulk of the logic)
+  - `lib/normalizers.js` — tool-call / chain-of-thought / XML-ish text normalization (~2700 lines; the bulk of the logic)
   - `lib/intent-synthesis.js` — when upstream answers with plain text instead of `tool_use`, synthesizes a tool call from deterministic signals (tool history, fenced block structure, render containers, explicit filenames, slash-commands). No hardcoded natural-language phrases. Uses the client's declared tool names.
   - `lib/system-prompt-injection.js` — **default ON** (`INJECT_SYSTEM_PROMPT=0` to opt out). Injects a dynamic tool contract (built from the client's tool list + schemas) into the system prompt to nudge weaker models toward calling tools instead of replying in text. Known trade-off: a few weak models emit OpenAI-style `{"name":"X",…}` JSON after seeing signatures, which surfaces as `No such tool available` in Claude Code — disable via env if you hit this.
   - `lib/sse.js` — synthesizes Anthropic & OpenAI SSE streams from a single non-stream upstream JSON reply
-- Tests: `node:test` under `test/`, fixtures under `testdata/`. ~120 cases in `normalizers.test.js` alone.
+- Tests: `node:test` under `test/`, fixtures under `testdata/`. ~150 cases in `normalizers.test.js` alone; separate `system-prompt-injection.test.js` and `server.test.js` suites.
 
 ## Commands
 
 - `npm test` — runs all tests via `node --test`. No services needed.
 - Single file: `node --test test/normalizers.test.js`
 - Single test: `node --test --test-name-pattern="extractPseudoToolCalls parses" test/normalizers.test.js`
-- Start server: `PORT=2393 UPSTREAM_BASE_URL=https://api.airforce AIRFORCE_API_KEY=... node server.js`
+- Start server: `PORT=2393 HOST=127.0.0.1 UPSTREAM_BASE_URL=https://api.airforce AIRFORCE_API_KEY=... node server.js` (HOST defaults to `0.0.0.0`)
+- Model aliasing: `MODEL_ALIASES='{"claude-sonnet-4-20250514":"provider/actual-model-id"}'`
 - Health: `GET /health` returns configured upstream, port, aliases.
 
 No lint or typecheck. Run tests.
@@ -33,8 +34,9 @@ No lint or typecheck. Run tests.
 - **Inbound auth is always replaced.** Client `authorization` and `x-api-key` are dropped; if `AIRFORCE_API_KEY` is set it's injected as both `Bearer` and `x-api-key`. Do not pass through client credentials.
 - **Synthetic streaming.** When `stream: true` hits `/anthropic/*`, `/v1/messages`, or `*/chat/completions`, the proxy calls upstream with `stream: false`, normalizes the full JSON, then re-emits it as SSE via `lib/sse.js`. Response carries `x-airforce-proxy-stream: synthetic`. Any new streaming path needs `shouldHandleSyntheticStream` in `server.js` AND the correct encoder branch.
 - **Upstream retry is automatic.** `fetchUpstreamWithRetry` retries on network errors, timeouts, 408/425/429, and 5xx with exponential backoff + jitter. Separately, if normalize returns an "effectively empty" payload, the proxy re-calls upstream with a **nudge-augmented request body** — a temporary `system` hint that escalates across retries (level 1: gentle reminder; level 2: "you MUST produce tool_use or text"; level 3+: "pick between tool_use or a clarifying text"). Conversation state (messages history) is never mutated; the nudge only lives in the retry's request body. Loop continues until the empty-retry **budget** (`EMPTY_RESPONSE_BUDGET_MS`, default 60s in FAST_MODE, 120s otherwise) is exhausted or the hard-limit `EMPTY_RESPONSE_MAX_RETRIES` (default 10) is hit. Defaults from `FAST_MODE` (default ON):
-  - `FAST_MODE=1`: 3 per-call attempts, 150ms base, 1.5s max, 120s per-call timeout, 10-retry/60s empty-retry budget
-  - `FAST_MODE=0`: 4 / 300ms / 3s / 180s / 10-retry/120s budget
+  - `FAST_MODE=1`: 3 per-call attempts, 150ms base, 1.5s max, 10-retry/60s empty-retry budget
+  - `FAST_MODE=0`: 4 per-call attempts, 300ms base, 3s max, 10-retry/120s empty-retry budget
+  - `UPSTREAM_TIMEOUT_MS` is **180s in both modes** (large-file Read + generation can exceed 2 min)
   - Override individually: `UPSTREAM_MAX_ATTEMPTS`, `UPSTREAM_RETRY_BASE_MS`, `UPSTREAM_RETRY_MAX_MS`, `UPSTREAM_TIMEOUT_MS`, `EMPTY_RESPONSE_MAX_RETRIES`, `EMPTY_RESPONSE_BUDGET_MS`, `RETRY_ON_EMPTY_RESPONSE=0` to disable.
   - `isNoProgressAssistantTurn` is language-agnostic and structural. Triggers retry in four cases: (1) completely empty payload; (2) only the proxy's own empty-response fallback text; (3) first-turn reply with user message + no prior tool_use + text-only (the "I'll start by exploring" stall); (4) **mid-session text-only reply where the session has only exploration tools (Read/Glob/Grep/Bash) — NO mutation (Write/Edit/Delete) yet**. Case 4 catches "Let me try a different approach:" / "Done!" style stalls where the model abandoned the task before actually producing the file change. Counter-case: if the last assistant tool_use was a mutation (Write/Edit/Delete), text-only response IS legitimate summary and is NOT retried. An earlier version regexed "Let me check..."-style text, which was language-biased and caused redundant retries.
   - Nudge text itself is language-agnostic: structural (`"Your previous response had no tool_use block and no text content. Do ONE of..."`). Context-aware — if prior tool_use history shows exploration without mutation, nudge mentions "you likely have enough context to invoke write/edit now".
@@ -86,6 +88,8 @@ Deterministic, language-agnostic. Runs only when upstream produced zero tool_use
 
 Schema field names are picked from the client's declared tool schema (`file_path` vs `filePath` vs `path`). Disable everything via `SYNTHESIZE_INTENT=0`.
 
+**OpenAI Chat history awareness.** History inspection (`getAssistantToolUses`, `collectPreviouslyReadTargets`, `findRecentExplorationToolResult`) understands BOTH message shapes: Anthropic (`assistant.content[]` with `tool_use` blocks) AND OpenAI Chat Completions (`assistant.content: null` + `tool_calls: [{ function: { name, arguments: '<json>' } }]` plus separate `role: 'tool'` result messages). An earlier version only parsed Anthropic shape, so on the OpenAI-compat path `priorCategories` always came back empty and `trySynthesizeList` re-emitted `Glob('**/*')` **every single turn**, producing the `✱ Glob "**/*"` loop. `trySynthesizeList` also has an explicit cross-turn guard: if any prior turn already used a list/glob tool (client-direct OR proxy-synthesized), the proxy refuses to synthesize again — loop is structurally impossible.
+
 Instrumentation tags in the user message (`<system-reminder>`, `<tool-output>`, `<claude-instructions>`, `<local-command-std*>`) are stripped before intent analysis so that filenames mentioned inside tool manifests don't poison the "user mentioned a specific file" heuristic. Tags that carry the user's real command (`<command-name>`, `<command-args>`, `<command-message>`) have their tag wrapper stripped but inner content kept.
 
 ### Misc
@@ -98,7 +102,7 @@ Instrumentation tags in the user message (`<system-reminder>`, `<tool-output>`, 
 
 - `test/server.test.js` sets `process.env.AIRFORCE_API_KEY` **before** `await import('...server.js')`. Preserve that pattern for any test that reads env at module load.
 - No mocking framework; pure `node:assert/strict`. Don't add a test runner dependency.
-- ~120 cases in `test/normalizers.test.js`. Add new scenarios alongside the closest existing block rather than starting a new file.
+- ~150 cases in `test/normalizers.test.js`. Add new scenarios alongside the closest existing block rather than starting a new file.
 - Many tests assert exact text content/trimming — changing whitespace in normalization breaks them like snapshots.
 
 ## Deployment

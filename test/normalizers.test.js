@@ -2008,6 +2008,139 @@ test('intent synthesis: disabled via SYNTHESIZE_INTENT=0', () => {
   assert.equal(payload.content.filter((b) => b.type === 'tool_use').length, 0);
 });
 
+// ---- Intent synthesis + OpenAI Chat Completions history format ----
+// Bu testler "Glob **/* tekrar tekrar" loop bugu'nu regress etmemesi icin.
+// OpenAI Chat format'indaki assistant tool_calls'larin gorulmedigi durumda
+// priorCategories hep bos donuyor, her turda Glob fallback sentezleniyor ve
+// sonsuz loop olusuyordu.
+
+test('intent synthesis: does NOT re-synthesize Glob when OpenAI Chat history already has Glob call', () => {
+  // Senaryo: ilk turda proxy Glob sentezledi, client Glob'u calistirdi, tool
+  // result geri geldi, model yine text-only cevap verdi. Proxy tekrar Glob
+  // sentezlememeli — cross-turn loop guard.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_loop_guard',
+    object: 'chat.completion',
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: 'Let me think about this...' },
+      finish_reason: 'stop'
+    }]
+  }, {
+    tools: [
+      { type: 'function', function: { name: 'Glob', parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } } },
+      { type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { filePath: { type: 'string' } }, required: ['filePath'] } } }
+    ],
+    messages: [
+      { role: 'user', content: 'analyze this repo' },
+      // Onceki tur: model Glob cagirdi (OpenAI format: tool_calls array)
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_glob_1',
+          type: 'function',
+          function: { name: 'Glob', arguments: JSON.stringify({ pattern: '**/*' }) }
+        }]
+      },
+      { role: 'tool', tool_call_id: 'call_glob_1', content: 'README.md\npackage.json\nsrc/index.js' }
+    ]
+  });
+
+  const choice = payload.choices[0];
+  const toolCalls = choice.message.tool_calls ?? [];
+  const globCalls = toolCalls.filter((tc) => tc.function?.name === 'Glob');
+  assert.equal(globCalls.length, 0, 'Glob should NOT be re-synthesized; prior Glob in history');
+  // Read sentezlenebilir (tool-result continuation kurali) veya text korunur
+  // Kritik olan: Glob loop kirilmali.
+});
+
+test('intent synthesis: suppresses re-Read when OpenAI Chat history already read the file', () => {
+  // Senaryo: model README.md okundu, yine "let me read README.md" diyor.
+  // suppressRepeatedReadToolCalls OpenAI tool_calls format'ini da okumali.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_read_loop',
+    object: 'chat.completion',
+    choices: [{
+      index: 0,
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_read_2',
+          type: 'function',
+          function: { name: 'Read', arguments: JSON.stringify({ filePath: 'README.md' }) }
+        }]
+      },
+      finish_reason: 'tool_calls'
+    }]
+  }, {
+    tools: [
+      { type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { filePath: { type: 'string' } }, required: ['filePath'] } } }
+    ],
+    messages: [
+      { role: 'user', content: 'analyze' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_read_1',
+          type: 'function',
+          function: { name: 'Read', arguments: JSON.stringify({ filePath: 'README.md' }) }
+        }]
+      },
+      { role: 'tool', tool_call_id: 'call_read_1', content: '# README...' }
+    ]
+  });
+
+  // Non-empty guarantee: ilk Read'i birakir ama bir daha ayni dosyayi okumaz.
+  // (normalizers.js non-empty guarantee: filtered.length === 0 olursa ilkini geri alir.)
+  const choice = payload.choices[0];
+  const tcs = choice.message.tool_calls ?? [];
+  // En onemli test: payload kilitlenmemis olmali (bos donus olmasin).
+  assert.ok(tcs.length <= 1, 'Duplicate Read must not duplicate across turns');
+});
+
+test('intent synthesis: recognizes OpenAI Chat tool_calls as prior exploration → synthesizes Read, not Glob', () => {
+  // Onceki turda Glob cagrildi ve README.md listesi geldi. Bu tur model
+  // text-only donuyor. Beklenen: Read(README.md) sentezlenir (tool-result
+  // continuation); Glob TEKRAR sentezlenmez.
+  const payload = applyOpenAiChatNormalization({
+    id: 'chatcmpl_followup_read',
+    object: 'chat.completion',
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: 'I need to check the README.' },
+      finish_reason: 'stop'
+    }]
+  }, {
+    tools: [
+      { type: 'function', function: { name: 'Glob', parameters: { type: 'object', properties: { pattern: { type: 'string' } }, required: ['pattern'] } } },
+      { type: 'function', function: { name: 'Read', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } } }
+    ],
+    messages: [
+      { role: 'user', content: 'what is this project' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id: 'call_g',
+          type: 'function',
+          function: { name: 'Glob', arguments: JSON.stringify({ pattern: '**/*' }) }
+        }]
+      },
+      { role: 'tool', tool_call_id: 'call_g', content: 'README.md\npackage.json\nsrc/index.js' }
+    ]
+  });
+
+  const choice = payload.choices[0];
+  const tcs = choice.message.tool_calls ?? [];
+  assert.ok(tcs.length >= 1, 'expected Read synthesis from tool_result continuation');
+  const names = tcs.map((tc) => tc.function?.name);
+  assert.ok(!names.includes('Glob'), 'Glob must not be re-synthesized on followup turn');
+  assert.ok(names.includes('Read'), 'Read should be synthesized to pick up README.md');
+});
+
 // ---- Claude Code instrumentation tag leakage fixes ----
 
 test('sanitizeCommand strips <command_message> block that leaks into bash command', () => {

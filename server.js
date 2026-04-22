@@ -541,10 +541,25 @@ const server = http.createServer(async (req, res) => {
         ? parsedBody.tools.map((tool) => tool?.name ?? tool?.function?.name).filter(Boolean)
         : [],
       messages: Array.isArray(parsedBody?.messages)
-        ? parsedBody.messages.slice(-3).map((message) => ({
-          role: message?.role,
-          summary: summarizeMessageContent(message?.content)
-        }))
+        ? parsedBody.messages.slice(-3).map((message) => {
+          const entry = {
+            role: message?.role,
+            summary: summarizeMessageContent(message?.content)
+          };
+          // OpenAI assistant message may have tool_calls (critical for debugging)
+          if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
+            entry.tool_calls = message.tool_calls.map((tc) => ({
+              id: tc?.id,
+              name: tc?.function?.name ?? tc?.name,
+              args: typeof tc?.function?.arguments === 'string' ? tc.function.arguments.slice(0, 100) : tc?.function?.arguments
+            }));
+          }
+          // OpenAI tool message has tool_call_id
+          if (message?.tool_call_id) {
+            entry.tool_call_id = message.tool_call_id;
+          }
+          return entry;
+        })
         : []
     });
     const shouldStreamLocally = shouldHandleSyntheticStream(requestUrl.pathname, parsedBody);
