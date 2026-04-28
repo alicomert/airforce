@@ -1,5 +1,7 @@
 // Logs tab — breakers + probe trigger + export/import + log tail.
 
+import { openConfirm, openAlert } from '../components/modal.js';
+
 let refreshTimer = null;
 
 export async function initLogs(root, api) {
@@ -19,12 +21,15 @@ export async function initLogs(root, api) {
   document.getElementById('probe-now').addEventListener('click', async () => {
     const r = await api('POST', '/admin/api/probe/run', {});
     const j = await r.json().catch(() => ({}));
-    alert(j.ok || j.message ? (j.message || 'Probe started') : 'Failed: ' + (j.error || 'unknown'));
+    await openAlert({
+      title: r.ok ? 'Probe Started' : 'Probe Failed',
+      message: j.message || j.error || (r.ok ? 'Probe is now running in the background.' : 'unknown error'),
+    });
   });
 
   document.getElementById('export-cfg').addEventListener('click', async () => {
     const r = await api('GET', '/admin/api/export');
-    if (!r.ok) { alert('Export failed'); return; }
+    if (!r.ok) { await openAlert({ title: 'Export Failed', message: `HTTP ${r.status}` }); return; }
     const j = await r.json();
     const blob = new Blob([JSON.stringify(j, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -41,14 +46,23 @@ export async function initLogs(root, api) {
     const file = e.target.files[0];
     if (!file) return;
     const text = await file.text();
-    if (!confirm('Import will overwrite current providers.json. Continue?')) return;
+    const ok = await openConfirm({
+      title: 'Import config?',
+      message: 'Bu işlem mevcut providers.json dosyasının üstüne yazar. Devam edilsin mi?',
+      confirmText: 'Import',
+      danger: true,
+    });
+    if (!ok) return;
     try {
       const cfg = JSON.parse(text);
       const r = await api('POST', '/admin/api/import', cfg);
       const j = await r.json();
-      alert(r.ok ? 'Imported. Reload tabs to see changes.' : 'Fail: ' + (j.error?.message || j.error || 'unknown'));
+      await openAlert({
+        title: r.ok ? 'Imported' : 'Import Failed',
+        message: r.ok ? 'Config imported. Sekmeleri yenile.' : (j.error?.message || j.error || 'unknown'),
+      });
     } catch (err) {
-      alert('Invalid JSON: ' + err.message);
+      await openAlert({ title: 'Invalid JSON', message: err.message });
     }
   });
 
