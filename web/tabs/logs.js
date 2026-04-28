@@ -55,6 +55,7 @@ export async function initLogs(root, api) {
   if (refreshTimer) clearInterval(refreshTimer);
   await refresh(api);
   refreshTimer = setInterval(() => refresh(api).catch(() => {}), 5000);
+  return () => { if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; } };
 }
 
 async function refresh(api) {

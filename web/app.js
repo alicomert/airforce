@@ -49,11 +49,18 @@ export async function api(method, urlPath, body) {
   return r;
 }
 
+let activeTabCleanup = null;
+
 async function switchTab(name) {
+  if (typeof activeTabCleanup === 'function') {
+    try { activeTabCleanup(); } catch {}
+    activeTabCleanup = null;
+  }
   document.querySelectorAll('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === name));
   const root = $('#content');
   root.innerHTML = '';
-  await TABS[name](root, api);
+  const cleanup = await TABS[name](root, api);
+  if (typeof cleanup === 'function') activeTabCleanup = cleanup;
 }
 
 document.querySelectorAll('#tabs button').forEach((b) => {

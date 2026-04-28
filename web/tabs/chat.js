@@ -20,13 +20,21 @@ export async function initChat(root, api) {
 
   const sel = document.getElementById('chat-model');
   try {
-    const r = await api('GET', '/v1/models');
+    // /v1/models bridge API key bekler; admin session ile /admin/api/providers'tan flatten edelim.
+    const r = await api('GET', '/admin/api/providers');
     const j = await r.json();
-    for (const m of (j.data || [])) {
-      const o = document.createElement('option');
-      o.value = m.id;
-      o.textContent = m.id + (m.provider_id ? ` (${m.provider_id})` : '');
-      sel.appendChild(o);
+    const seen = new Set();
+    for (const p of (j.providers || [])) {
+      for (const m of (p.models || [])) {
+        if (!m.enabled) continue;
+        const id = m.presented_id || (m.upstream_id.includes('/') ? m.upstream_id.split('/').pop() : m.upstream_id);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const o = document.createElement('option');
+        o.value = id;
+        o.textContent = `${id} (${p.id})`;
+        sel.appendChild(o);
+      }
     }
     if (!sel.options.length) sel.appendChild(new Option('glm-4.6', 'glm-4.6'));
   } catch {
