@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "model_aliases": {
+    "claude-sonnet-4-20250514": "glm-4.6",
+    "claude-opus-4-20250514": "glm-4.6",
+    "gpt-4o": "glm-4.6",
+    "gpt-4-turbo": "glm-4.6"
+  },
+  "default_model": "glm-4.6",
+  "tool_engine": {
+    "format": "canonical",
+    "force_xml": true,
+    "system_prompt_position": "append"
+  },
+  "probe": {
+    "interval_hours": 24,
+    "skip_models_with_substring": ["-p2g", "-rp", ":free", "image", "midjourney", "suno"],
+    "include_payg": false
+  },
+  "ui": {
+    "theme": "dark",
+    "title": "Airforce Bridge"
+  }
+}

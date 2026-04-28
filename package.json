@@ -1,10 +1,17 @@
 {
-  "name": "airforce-compat-proxy",
+  "name": "airforce-bridge",
   "version": "0.1.0",
-  "private": true,
+  "description": "api.airforce için tool-call destekli OpenAI + Anthropic uyumlu köprü sunucu",
   "type": "module",
+  "private": true,
+  "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test"
+    "dev": "node --watch server.js",
+    "test": "node --test test/parse.test.js test/inject.test.js test/serialize-history.test.js",
+    "probe": "node -e \"import('./lib/probe.js').then(m => m.runProbe())\""
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

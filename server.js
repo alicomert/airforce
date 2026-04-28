@@ -1,946 +1,179 @@
+// Airforce Bridge — HTTP entry point.
+//
+// Routes:
+//   GET  /healthz                         (auth: none)
+//   GET  /v1/models                       (auth: bridge)
+//   POST /v1/chat/completions             (auth: bridge)
+//   POST /v1/messages                     (auth: bridge — Anthropic-native)
+//   GET  /admin                           (auth: admin — panel HTML)
+//   GET  /admin/static/*                  (auth: admin — JS/CSS)
+//   GET/POST/DELETE /admin/api/*          (auth: admin)
+
 import http from 'node:http';
-import process from 'node:process';
-import { inspect } from 'node:util';
-import { resolve } from 'node:path';
+import fs from 'node:fs';
+import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import {
-  maybeRewriteModel,
-  normalizeJsonPayload,
-  normalizeRequestMessages,
-  normalizeRequestTools,
-  restorePresentedModel
-} from './lib/normalizers.js';
-import {
-  anthropicSseFromMessage,
-  openAiChatSseFromCompletion
-} from './lib/sse.js';
-import { injectSystemPromptForPath } from './lib/system-prompt-injection.js';
-import { buildAutoRecoveryPayload, AUTO_RECOVERY_ENABLED } from './lib/auto-recovery.js';
+import { config, summarize, ROOT_DIR } from './lib/config.js';
+import { log } from './lib/logger.js';
+import { isAuthorized } from './lib/auth.js';
+import { handleListModels } from './lib/adapters/models.js';
+import { handleOpenAiChatCompletions } from './lib/adapters/openai.js';
+import { handleAnthropicMessages } from './lib/adapters/anthropic.js';
+import { handleAdminApi } from './lib/admin-router.js';
+import * as scheduler from './lib/scheduler.js';
 
-const PORT = Number(process.env.PORT || 2393);
-const HOST = process.env.HOST || '0.0.0.0';
-const UPSTREAM_BASE_URL = (process.env.UPSTREAM_BASE_URL || 'https://api.airforce').replace(/\/+$/, '');
-const DEFAULT_API_KEY = process.env.AIRFORCE_API_KEY || '';
-const MODEL_ALIASES = parseAliases(process.env.MODEL_ALIASES);
-const DEBUG_LOGS = process.env.DEBUG_LOGS !== '0';
-// FAST_MODE=1: kullanici "sistem yavas" dedi; default degerleri sikistirilmis
-// versiyona getir. Her biri env ile tekil override edilebilir.
-const FAST_MODE = process.env.FAST_MODE !== '0';
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const WEB_DIR = path.join(__dirname, 'web');
 
-// Upstream retry config. Network/5xx/408/425/429 icin exponential backoff.
-// FAST_MODE defaults (hizli ama hala resilient):
-//   - Attempt sayisi: 3 (2 retry + orjinal). 4 uzundu.
-//   - Base delay: 150ms. 300 yavas kaliyordu.
-//   - Max delay: 1.5s. 3s cok uzun.
-// Normal mode defaults (eski deger):
-//   - 4 attempt, 300ms base, 3s max
-const UPSTREAM_MAX_ATTEMPTS = Math.max(1, Number(process.env.UPSTREAM_MAX_ATTEMPTS || (FAST_MODE ? 3 : 4)));
-const UPSTREAM_RETRY_BASE_MS = Math.max(50, Number(process.env.UPSTREAM_RETRY_BASE_MS || (FAST_MODE ? 150 : 300)));
-const UPSTREAM_RETRY_MAX_MS = Math.max(200, Number(process.env.UPSTREAM_RETRY_MAX_MS || (FAST_MODE ? 1500 : 3000)));
-// Tek bir upstream isteginin max suresi (ms). Default 3 dakika.
-// Buyuk dosya Read + model generation + uzun content tek turda 2 dakikayi
-// asabiliyor (100KB+ dosya analizinde real-world timeout gorulmustu).
-// 180s hem FAST_MODE'da hem de normal mode'da artik guvenli default.
-const UPSTREAM_TIMEOUT_MS = Math.max(5000, Number(process.env.UPSTREAM_TIMEOUT_MS || 180000));
-// Normalize sonrasi tamamen bos (ne text ne tool_use) cevap gelirse tekrar cagir.
-// Her retry'da upstream prompt'una daha direkt bir nudge eklenir; conversation
-// state (messages history) DEGISMEZ, sadece request body icindeki system
-// bolumune temporary bir hint eklenir. Bu, zayif modelleri (glm-5 vb.) tool
-// kullanmaya ittirir ve kullanicinin "sistem durdu" deneyimini onler.
-//
-// YENI DEFAULTLAR (daha agresif / daha az bekleme):
-//   - EMPTY_RESPONSE_MAX_RETRIES: 3 (onceden 10). Saglam bir upstream 1-2
-//     retry icinde kendine gelir; gelmiyorsa daha cok beklemek faydasiz.
-//   - EMPTY_RESPONSE_BUDGET_MS: 15s (onceden FAST:60s / normal:120s).
-//     Kullanici bekleme toleransi kritik - 15 saniye '...' gormek maksimum.
-// Eski "sabit bekle, cok dene" davranisi kullanicilarin "model degistir"
-// mesaji gormesine ve 60-120 saniye bekleyip yine de bos donus almasina
-// sebep oluyordu. Istisna: son mesaj bir tool hatasi (File not found, error,
-// permission denied) ise retry TAMAMEN atlanir - upstream ayni hata sonucu
-// gorerek dogru cevap uretemiyor, retry sadece bekletir; hemen fallback text
-// ile donelim ki client (OpenCode/Claude Code) tekrar denesin.
-const RETRY_ON_EMPTY_RESPONSE = process.env.RETRY_ON_EMPTY_RESPONSE !== '0';
-const EMPTY_RESPONSE_MAX_RETRIES = Math.max(0, Number(process.env.EMPTY_RESPONSE_MAX_RETRIES || 3));
-const EMPTY_RESPONSE_BUDGET_MS = Math.max(3000, Number(process.env.EMPTY_RESPONSE_BUDGET_MS || 15000));
-// Son tool_result hata mesaji mi? (File not found / permission denied / error:)
-// Bu durumda empty-retry anlamsiz - upstream ayni hatayi tekrar tekrar
-// gormekten cevap uretemez. Client'in hatayi gorup tekrar denemesi gerek.
-const SKIP_EMPTY_RETRY_ON_TOOL_ERROR = process.env.SKIP_EMPTY_RETRY_ON_TOOL_ERROR !== '0';
+const STATIC_MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.ico': 'image/x-icon',
+};
 
-function parseAliases(raw) {
-  if (!raw) {
-    return {};
-  }
-
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === 'object' ? parsed : {};
-  } catch {
-    return {};
-  }
+function send(res, status, obj, extraHeaders = {}) {
+  res.statusCode = status;
+  res.setHeader('content-type', 'application/json; charset=utf-8');
+  for (const [k, v] of Object.entries(extraHeaders)) res.setHeader(k, v);
+  res.end(JSON.stringify(obj));
 }
 
-function summarizeMessageContent(content) {
-  if (typeof content === 'string') {
-    return content.slice(0, 160);
-  }
-  if (!Array.isArray(content)) {
-    return '';
-  }
-  return content.map((block) => {
-    if (block?.type === 'text') {
-      return `text:${String(block.text ?? '').slice(0, 80)}`;
-    }
-    if (block?.type === 'tool_use') {
-      return `tool_use:${block.name}`;
-    }
-    if (block?.type === 'tool_result') {
-      return `tool_result:${block.tool_use_id}`;
-    }
-    return block?.type ?? typeof block;
-  }).join(' | ').slice(0, 200);
-}
+function notFound(res) { return send(res, 404, { error: 'not_found' }); }
+function unauthorized(res) { return send(res, 401, { error: 'unauthorized' }); }
 
-function logDebug(label, value) {
-  if (!DEBUG_LOGS) {
-    return;
-  }
-  // Node'un default inspect depth 2'dir; tool_use.input ic ice oldugu icin
-  // `[Object]` seklinde cikiyor. Tani icin genislet.
-  console.log(`[DEBUG] ${label}:`, inspect(value, { depth: 5, colors: false, breakLength: 120 }));
-}
-
-function sendJson(res, status, body) {
-  const payload = JSON.stringify(body);
-  res.writeHead(status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': Buffer.byteLength(payload),
-    'access-control-allow-origin': '*',
-    'access-control-allow-headers': 'authorization, content-type, x-api-key, anthropic-version, anthropic-beta',
-    'access-control-allow-methods': 'GET,POST,OPTIONS'
-  });
-  res.end(payload);
-}
-
-function readBody(req) {
+function readJsonBody(req) {
   return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    let data = '';
+    let limited = false;
+    req.on('data', (c) => {
+      data += c;
+      if (data.length > 8 * 1024 * 1024) {
+        limited = true;
+        reject(new Error('payload too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (limited) return;
+      if (!data) return resolve({});
+      try { resolve(JSON.parse(data)); } catch (e) { reject(e); }
+    });
     req.on('error', reject);
   });
 }
 
-export function buildUpstreamHeaders(req, bodyLength) {
-  const headers = new Headers();
-
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (value == null) {
-      continue;
-    }
-    if (['host', 'content-length', 'connection', 'x-api-key', 'authorization'].includes(key.toLowerCase())) {
-      continue;
-    }
-    headers.set(key, Array.isArray(value) ? value.join(', ') : value);
-  }
-
-  if (DEFAULT_API_KEY) {
-    headers.set('authorization', `Bearer ${DEFAULT_API_KEY}`);
-    headers.set('x-api-key', DEFAULT_API_KEY);
-  }
-  if (bodyLength != null) {
-    headers.set('content-length', String(bodyLength));
-  }
-
-  return headers;
+function corsPreflight(req, res) {
+  res.statusCode = 204;
+  res.setHeader('access-control-allow-origin', req.headers.origin || '*');
+  res.setHeader('access-control-allow-headers', 'authorization, x-api-key, content-type, anthropic-version, anthropic-beta');
+  res.setHeader('access-control-allow-methods', 'GET, POST, DELETE, OPTIONS');
+  res.setHeader('access-control-max-age', '86400');
+  res.end();
 }
 
-export function shouldHandleSyntheticStream(pathname, requestBody) {
-  return Boolean(requestBody?.stream) && (
-    pathname.includes('/anthropic/') ||
-    pathname === '/v1/messages' ||
-    pathname.endsWith('/chat/completions')
-  );
+function applyCors(req, res) {
+  res.setHeader('access-control-allow-origin', req.headers.origin || '*');
+  res.setHeader('access-control-expose-headers', 'x-airforce-bridge-stream');
 }
 
-function mapUpstreamPath(pathname) {
-  if (pathname.startsWith('/anthropic/')) {
-    return pathname.slice('/anthropic'.length) || '/';
-  }
-  return pathname;
+function serveStatic(req, res, urlPath) {
+  // /admin/static/foo.js → web/foo.js
+  let fname = urlPath.replace(/^\/admin\/static\//, '');
+  if (fname === '' || fname.includes('..')) return notFound(res);
+  const fp = path.join(WEB_DIR, fname);
+  if (!fp.startsWith(WEB_DIR)) return notFound(res);
+  if (!fs.existsSync(fp) || !fs.statSync(fp).isFile()) return notFound(res);
+  const ext = path.extname(fp).toLowerCase();
+  res.setHeader('content-type', STATIC_MIME[ext] || 'application/octet-stream');
+  res.setHeader('cache-control', 'no-cache');
+  fs.createReadStream(fp).pipe(res);
 }
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-function backoffDelay(attempt) {
-  const exp = UPSTREAM_RETRY_BASE_MS * Math.pow(2, attempt - 1);
-  const capped = Math.min(exp, UPSTREAM_RETRY_MAX_MS);
-  // Jitter: +/-25%
-  const jitter = capped * (0.75 + Math.random() * 0.5);
-  return Math.floor(jitter);
-}
-
-function isRetriableStatus(status) {
-  // 408 timeout, 425 too early, 429 rate limit, 5xx server errors
-  return status === 408 || status === 425 || status === 429 || (status >= 500 && status < 600);
-}
-
-// Legacy empty-response fallback text. Sadece AUTO_RECOVERY=0 +
-// EMPTY_RESPONSE_LEGACY_TEXT=1 iken kullaniciya gosterilir. Normal default'ta
-// auto-recovery devrede oldugu icin bu string HIC basilmaz. isNoProgress
-// guard'i hala bu metni (ve SILENT_PROGRESS_TEXT '.') no-progress olarak
-// tespit edip retry tetiklemeyi engeller (eski session'larda history'de
-// bu metin varsa).
-const LEGACY_EMPTY_MESSAGE = 'The upstream model returned an empty response. Please rephrase the request or try a different model.';
-const EMPTY_RESPONSE_LEGACY_TEXT = process.env.EMPTY_RESPONSE_LEGACY_TEXT === '1';
-
-// Normalize sonrasi cevap gercekten bos mu? Anthropic: content[] tamamen bos/text-empty
-// ve tool_use yok. OpenAI chat: choices bos veya tum choice'larin mesaji bos ve tool_call yok.
-function isEffectivelyEmpty(pathname, payload) {
-  if (!payload || typeof payload !== 'object') {
-    return true;
-  }
-  if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
-    if (!Array.isArray(payload.content)) {
-      return true;
-    }
-    const hasToolUse = payload.content.some((b) => b?.type === 'tool_use');
-    const hasThinking = payload.content.some((b) => b?.type === 'thinking' && typeof b?.thinking === 'string' && b.thinking.trim().length > 0);
-    const hasText = payload.content.some((b) => b?.type === 'text' && typeof b?.text === 'string' && b.text.trim().length > 0);
-    return !hasToolUse && !hasText && !hasThinking;
-  }
-  if (pathname.endsWith('/chat/completions')) {
-    if (!Array.isArray(payload.choices) || payload.choices.length === 0) {
-      return true;
-    }
-    return payload.choices.every((choice) => {
-      const msg = choice?.message;
-      const hasContent = typeof msg?.content === 'string' && msg.content.trim().length > 0;
-      const hasToolCalls = Array.isArray(msg?.tool_calls) && msg.tool_calls.length > 0;
-      return !hasContent && !hasToolCalls;
-    });
-  }
-  return false;
-}
-
-// "No progress" turu tespiti (dil-bagimsiz, deterministik, yapisal).
-//
-// Bu fonksiyon retry'i tetikler. Kurallar:
-//
-//   TRUE don eger:
-//     - Payload tamamen bos (ne text ne tool_use)
-//     - Sadece proxy'nin kendi empty-fallback mesaji var
-//     - **YENI**: Session'in ilk turunde (hic prior tool_use yok),
-//       kullanici bir talep gonderdi (mesaji bos degil) ama model SADECE
-//       text dondu + tool_use YOK. Bu "is yapmadi, sadece laf etti"
-//       durumudur. Kullanici "exploreliyorum" kisvesinde bir cevap gormek
-//       istemez, aksiyon ister. Nudge ile retry tetikle.
-//
-//   FALSE don (legitimate, retry YOK):
-//     - Payload'da tool_use var (model is yapti)
-//     - Payload'da thinking var (model dusunuyor, geride tool_use gelecek)
-//     - Session'da prior tool_use VAR (bu bir ara tur veya ozet tur, model
-//       iste ilerliyor, text cevabi mesru olabilir)
-//
-// Dile bagimli kelime regex'i YOK. Sadece yapisal sinyaller: tool_use var mi,
-// thinking var mi, prior history'de tool kullanildi mi.
-export function isNoProgressAssistantTurn(pathname, payload, requestBody) {
-  if (!payload || typeof payload !== 'object') {
-    return true;
-  }
-  if (isEffectivelyEmpty(pathname, payload)) {
-    return true;
-  }
-  if (!(pathname.includes('/anthropic/') || pathname === '/v1/messages')) {
-    return false;
-  }
-  if (!Array.isArray(payload.content) || payload.content.length === 0) {
-    return true;
-  }
-  const hasToolUse = payload.content.some((b) => b?.type === 'tool_use');
-  const hasThinking = payload.content.some((b) => b?.type === 'thinking' && typeof b?.thinking === 'string' && b.thinking.trim());
-  if (hasToolUse || hasThinking) {
-    return false;
-  }
-  const textBlocks = payload.content
-    .filter((b) => b?.type === 'text' && typeof b?.text === 'string')
-    .map((b) => b.text.trim())
-    .filter(Boolean);
-  if (textBlocks.length === 0) {
-    return true;
-  }
-  // Proxy'nin kendi legacy fallback mesaji -> kesinlikle no-progress
-  // (AUTO_RECOVERY=0 + EMPTY_RESPONSE_LEGACY_TEXT=1 modu; normalde yoksa da
-  //  geriye donuk session'lar icin guard)
-  if (textBlocks.every((text) => text === LEGACY_EMPTY_MESSAGE || text === '.')) {
-    return true;
-  }
-  // Requestbody yoksa risk alma, legit kabul et (geriye donuk uyumluluk).
-  if (!requestBody || !Array.isArray(requestBody.messages)) {
-    return false;
-  }
-
-  // Prior history analizi (yapisal sinyal toplama).
-  let priorToolUseCount = 0;
-  let userMessageCount = 0;
-  let lastAssistantToolCategory = null;
-  for (const msg of requestBody.messages) {
-    if (msg?.role === 'user') userMessageCount += 1;
-    if (msg?.role !== 'assistant' || !Array.isArray(msg?.content)) continue;
-    for (const block of msg.content) {
-      if (block?.type !== 'tool_use') continue;
-      priorToolUseCount += 1;
-      const normalized = String(block?.name ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
-      if (/^(write|writefile|createfile|edit|editfile|strreplace|multiedit|delete|deletefile|rm|remove)/.test(normalized)) {
-        lastAssistantToolCategory = 'mutation';
-      } else if (/^(read|readfile|glob|grep|listdirectory|search|bash|shell|exec|powershell)/.test(normalized)) {
-        lastAssistantToolCategory = 'exploration';
-      } else {
-        lastAssistantToolCategory = 'other';
-      }
-    }
-  }
-
-  // Case 3: Session ilk turde, hic tool_use yok, model sadece text.
-  if (priorToolUseCount === 0 && userMessageCount >= 1) {
-    return true;
-  }
-
-  // Case 4: Session ortasinda, son tool MUTATION degildi (yani model hala
-  // kesif fazindaydi) ve model simdi text-only dondu. Is yarim kaldi:
-  // exploration bitmis gibi gorunuyor ama hic Write/Edit gelmedi. Retry.
-  //
-  // Karşı sinyal: eger son tool MUTATION idi (Write/Edit/Delete basarili),
-  // text cevap legitimate "bittigini ozetliyor" olabilir - DOKUNMA.
-  if (priorToolUseCount > 0 && lastAssistantToolCategory === 'exploration') {
-    // Kullanicinin en son user mesajinda bir is istegi var mi kontrolu yok
-    // (dile bagimli olur). Yapisal kural: exploration sonrasi text-only
-    // cevap + end_turn ve ikinci/ucuncu user talebi yok ise MUTATION
-    // eksik, retry et.
-    return true;
-  }
-
-  return false;
-}
-
-// ESKI: Empty payload gelince kullaniciya "The upstream model returned an
-// empty response. Please rephrase the request or try a different model."
-// mesaji gosteriyordu. Bu mesaj artik GOSTERILMIYOR.
-//
-// YENI: Auto-recovery (lib/auto-recovery.js) devreye girer:
-//   1) history'e bakip deterministik bir tool_use sentezler (Read/Glob/Write)
-//   2) sentez imkansizsa minimal bir '.' text + end_turn doner (gorulmez)
-//
-// Boylece kullanici ne "empty response" text'i gorur, ne "model degistir"
-// yazisi. Session canli kalir; client (OpenCode/Claude Code) normal bir
-// cevapla turn'u bitirir, kullanici bir sonraki prompt'u yazar.
-//
-// Auto-recovery'yi kapatmak icin: AUTO_RECOVERY=0 (gereksiz; sadece debugging)
-// Legacy fallback text'e donmek icin: AUTO_RECOVERY=0 + EMPTY_RESPONSE_LEGACY_TEXT=1
-// (LEGACY_EMPTY_MESSAGE ve EMPTY_RESPONSE_LEGACY_TEXT sabitleri yukarida
-//  isNoProgressAssistantTurn'den once tanimli; guard icin orada lazim.)
-
-function injectEmptyResponseFallback(pathname, payload, requestBody) {
-  // Yeni default: auto-recovery
-  if (AUTO_RECOVERY_ENABLED && !EMPTY_RESPONSE_LEGACY_TEXT) {
-    const recovered = buildAutoRecoveryPayload(pathname, requestBody, payload);
-    if (recovered) return recovered;
-  }
-
-  // Legacy path (sadece AUTO_RECOVERY=0 + EMPTY_RESPONSE_LEGACY_TEXT=1 ile):
-  if (!payload || typeof payload !== 'object') {
-    payload = {};
-  }
-  if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
-    return {
-      ...payload,
-      content: [{ type: 'text', text: LEGACY_EMPTY_MESSAGE }],
-      stop_reason: payload.stop_reason && payload.stop_reason !== 'tool_use' ? payload.stop_reason : 'end_turn'
-    };
-  }
-  if (pathname.endsWith('/chat/completions')) {
-    const firstChoice = Array.isArray(payload.choices) && payload.choices[0] ? payload.choices[0] : {};
-    return {
-      ...payload,
-      choices: [{
-        ...firstChoice,
-        index: firstChoice.index ?? 0,
-        finish_reason: firstChoice.finish_reason && firstChoice.finish_reason !== 'tool_calls' ? firstChoice.finish_reason : 'stop',
-        message: {
-          role: 'assistant',
-          content: LEGACY_EMPTY_MESSAGE
-        }
-      }]
-    };
-  }
-  return payload;
-}
-
-// Bos cevap durumunda upstream'e yeniden cagri atarken, modeli tool kullanimina
-// tesvik eden bir "nudge" ekler. Conversation state DEGISMEZ: sadece request
-// body'nin system bolumune gecici bir hint yazilir. Nudge'lar dile bagimsiz,
-// yapisal. Her retry'da artan bir siddetle:
-//   Level 1: nazik hatirlatma
-//   Level 2: daha acik (tool kullanma zorunlulugu)
-//   Level 3+: sonuc odakli ("son turdaki goreve geri don")
-function buildEmptyRetryNudge(attempt, priorToolCategories) {
-  const hasExploration = priorToolCategories.has('bash') || priorToolCategories.has('list') || priorToolCategories.has('grep') || priorToolCategories.has('read');
-  const hasMutation = priorToolCategories.has('write') || priorToolCategories.has('edit');
-
-  // Temel mesaj her seviyede ayni dil-bagimsiz yapisal talimat
-  const parts = [
-    '[airforce-proxy retry nudge]',
-    `Your previous response had no tool_use block and no text content.`
-  ];
-
-  if (attempt === 1) {
-    parts.push('If the user asked for an action, call the appropriate tool. If you need more information, produce a short clarifying text instead of an empty reply.');
-  } else if (attempt === 2) {
-    parts.push('Previous retry also returned empty. You MUST produce either a tool_use block (preferred if the user requested an action) or at least one non-empty text block explaining the blocker.');
-  } else {
-    // 3+ - en direkt
-    parts.push('Multiple retries returned empty responses. Do ONE of the following right now: (a) emit a tool_use block that progresses the task, or (b) emit a text block describing exactly what information or clarification you need from the user. Do not return empty content.');
-  }
-
-  // Context-aware ekleme: onceki turlarda kesif yapildi ama yazma yok
-  if (hasExploration && !hasMutation) {
-    parts.push('The session already performed exploration tool calls. If the user asked you to create, modify, or generate a file, you likely have enough context to invoke the write/edit tool now.');
-  }
-
-  return parts.join(' ');
-}
-
-// Request body'ye gecici nudge ekle. Anthropic format (system: string|array)
-// ve OpenAI chat format (messages icinde role:'system') ikisini de destekle.
-function injectEmptyRetryNudgeIntoBody(parsedBody, upstreamBody, pathname, nudgeText) {
-  if (!upstreamBody || typeof upstreamBody !== 'object') return upstreamBody;
-
-  if (pathname.includes('/anthropic/') || pathname === '/v1/messages') {
-    const existing = upstreamBody.system;
-    let newSystem;
-    if (existing == null || existing === '') {
-      newSystem = nudgeText;
-    } else if (typeof existing === 'string') {
-      newSystem = `${existing}\n\n${nudgeText}`;
-    } else if (Array.isArray(existing)) {
-      newSystem = [...existing, { type: 'text', text: nudgeText }];
-    } else {
-      newSystem = existing;
-    }
-    return { ...upstreamBody, system: newSystem };
-  }
-
-  if (pathname.endsWith('/chat/completions') || pathname.endsWith('/responses')) {
-    const messages = Array.isArray(upstreamBody.messages) ? upstreamBody.messages : [];
-    const newMessages = [
-      ...messages,
-      { role: 'system', content: nudgeText }
-    ];
-    return { ...upstreamBody, messages: newMessages };
-  }
-
-  return upstreamBody;
-}
-
-// Request body'de daha once hangi tool kategorileri kullanildi? Dil-bagimsiz,
-// tool adini proxy'nin bildigi alias listesiyle eslesir. Returns Set of
-// category strings: 'bash', 'read', 'write', 'edit', 'list', 'grep'.
-function collectPriorToolCategories(parsedBody) {
-  const categories = new Set();
-  const messages = Array.isArray(parsedBody?.messages) ? parsedBody.messages : [];
-  // Simple inline mapping - tool name (case-insensitive, normalize) -> category
-  const categoryMap = {
-    bash: 'bash', shell: 'bash', exec: 'bash', powershell: 'bash',
-    read: 'read', readfile: 'read', read_file: 'read', openfile: 'read', viewfile: 'read',
-    write: 'write', writefile: 'write', write_file: 'write', createfile: 'write',
-    edit: 'edit', editfile: 'edit', strreplace: 'edit', multiedit: 'edit',
-    glob: 'list', listdirectory: 'list', list_directory: 'list', findfiles: 'list',
-    grep: 'grep', search: 'grep', ripgrep: 'grep', contentsearch: 'grep'
-  };
-  const addName = (rawName) => {
-    const name = String(rawName ?? '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const cat = categoryMap[name];
-    if (cat) categories.add(cat);
-  };
-  for (const msg of messages) {
-    if (msg?.role !== 'assistant') continue;
-    // Anthropic format: content[].tool_use
-    if (Array.isArray(msg.content)) {
-      for (const block of msg.content) {
-        if (block?.type === 'tool_use') addName(block?.name);
-      }
-    }
-    // OpenAI Chat format: tool_calls[].function.name
-    if (Array.isArray(msg.tool_calls)) {
-      for (const tc of msg.tool_calls) {
-        addName(tc?.function?.name ?? tc?.name);
-      }
-    }
-  }
-  return categories;
-}
-
-// Son tool_result bir hata mesaji iceriyor mu? Iki formati da destekler:
-//   Anthropic: user.content[] icinde { type: 'tool_result', is_error: true } VEYA
-//              content stringinde File not found / permission denied / error:
-//   OpenAI Chat: { role: 'tool', content: '<string>' }
-//
-// Kullanim: empty payload retry atlanmasi icin sinyal. Upstream, son turda
-// 'File not found' gorurse cogu zaman cevap uretemiyor; biz 3+ kere daha
-// bos deneyeceğimize hemen kullaniciya text fallback donelim, client
-// (OpenCode/Claude Code) hatayi gorup kendi dogru path'i bulsun.
-export function isLastToolResultAnError(parsedBody) {
-  const messages = Array.isArray(parsedBody?.messages) ? parsedBody.messages : [];
-  const ERROR_PATTERNS = [
-    /\bfile not found\b/i,
-    /\bno such file\b/i,
-    /\bpermission denied\b/i,
-    /\bnot found:/i,
-    /\benoent\b/i,
-    /\bEPERM\b/,
-    /\berror:/i,
-    /\bfailed:/i,
-    /\bcannot (?:read|write|access|find|open)\b/i
-  ];
-  const textLooksLikeError = (text) => {
-    if (typeof text !== 'string') return false;
-    // Kisa text'te aramayalim - false positive riski. Uzun prose'da 'error:'
-    // kelimesi gecebilir.
-    const trimmed = text.trim();
-    if (trimmed.length < 4) return false;
-    if (trimmed.length > 2000) return false; // buyuk dosya icerikleri hata degil
-    return ERROR_PATTERNS.some((re) => re.test(trimmed));
-  };
-  // En son tool_result mesajini bul
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const msg = messages[i];
-    if (!msg) continue;
-    // OpenAI Chat: role === 'tool'
-    if (msg.role === 'tool') {
-      const content = typeof msg.content === 'string'
-        ? msg.content
-        : (Array.isArray(msg.content) ? msg.content.map((b) => (typeof b === 'string' ? b : b?.text ?? '')).join('\n') : '');
-      return textLooksLikeError(content);
-    }
-    // Anthropic: user.content[].tool_result
-    if (msg.role === 'user' && Array.isArray(msg.content)) {
-      const toolResultBlocks = msg.content.filter((b) => b?.type === 'tool_result');
-      if (toolResultBlocks.length === 0) continue;
-      // is_error flag? (Anthropic spec)
-      if (toolResultBlocks.some((b) => b.is_error === true)) return true;
-      // Text icerigi hata pattern'i iceriyor mu?
-      for (const block of toolResultBlocks) {
-        const text = typeof block.content === 'string'
-          ? block.content
-          : (Array.isArray(block.content) ? block.content.map((c) => (typeof c === 'string' ? c : c?.text ?? '')).join('\n') : '');
-        if (textLooksLikeError(text)) return true;
-      }
-      return false;
-    }
-    // Assistant mesaji geldiyse (tool_result yok), bu turda zaten tool_result olmamis
-    if (msg.role === 'assistant') return false;
-  }
-  return false;
-}
-
-// Upstream'e fetch + timeout + retry. Network hatasi, 5xx, 408/425/429'da otomatik yeniden dener.
-// 4xx (429 disinda) ve 2xx/3xx durumunda response'u oldugu gibi dondurur.
-async function fetchUpstreamWithRetry(upstreamUrl, fetchOptions, logLabel) {
-  let lastError = null;
-  let lastResponse = null;
-  for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('upstream-timeout')), UPSTREAM_TIMEOUT_MS);
-    try {
-      const response = await fetch(upstreamUrl, { ...fetchOptions, signal: controller.signal });
-      clearTimeout(timer);
-      if (!isRetriableStatus(response.status)) {
-        return response;
-      }
-      lastResponse = response;
-      logDebug('upstream_retry_status', { attempt, status: response.status, label: logLabel });
-      if (attempt >= UPSTREAM_MAX_ATTEMPTS) {
-        return response;
-      }
-      // Body'yi okuyup at (connection reuse icin)
-      try { await response.text(); } catch { /* ignore */ }
-    } catch (error) {
-      clearTimeout(timer);
-      lastError = error;
-      logDebug('upstream_retry_error', {
-        attempt,
-        label: logLabel,
-        message: error instanceof Error ? error.message : String(error)
-      });
-      if (attempt >= UPSTREAM_MAX_ATTEMPTS) {
-        break;
-      }
-    }
-    await sleep(backoffDelay(attempt));
-  }
-  if (lastResponse) {
-    return lastResponse;
-  }
-  throw lastError ?? new Error('Upstream request failed after retries');
-}
-
-function appendAliasModels(payload) {
-  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.data) || Object.keys(MODEL_ALIASES).length === 0) {
-    return payload;
-  }
-
-  const existingIds = new Set(payload.data.map((item) => item?.id).filter(Boolean));
-  const appended = Object.keys(MODEL_ALIASES)
-    .filter((alias) => !existingIds.has(alias))
-    .map((alias) => ({
-      id: alias,
-      object: 'model',
-      created: 0,
-      owned_by: 'airforce-compat-proxy'
-    }));
-
-  return {
-    ...payload,
-    data: [...payload.data, ...appended]
-  };
+function servePanel(req, res) {
+  const fp = path.join(WEB_DIR, 'index.html');
+  if (!fs.existsSync(fp)) return send(res, 500, { error: 'panel not built' });
+  res.setHeader('content-type', 'text/html; charset=utf-8');
+  fs.createReadStream(fp).pipe(res);
 }
 
 const server = http.createServer(async (req, res) => {
-  if (!req.url) {
-    sendJson(res, 400, { error: 'Missing request URL' });
-    return;
-  }
+  const start = Date.now();
+  const urlPath = req.url.split('?')[0];
+  const method = req.method;
 
-  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'access-control-allow-origin': '*',
-      'access-control-allow-headers': 'authorization, content-type, x-api-key, anthropic-version, anthropic-beta',
-      'access-control-allow-methods': 'GET,POST,OPTIONS'
-    });
-    res.end();
-    return;
-  }
-
-  if (requestUrl.pathname === '/health') {
-    sendJson(res, 200, {
-      ok: true,
-      upstream: UPSTREAM_BASE_URL,
-      port: PORT,
-      aliases: MODEL_ALIASES
-    });
-    return;
-  }
-
-  if (!requestUrl.pathname.startsWith('/anthropic/') && !requestUrl.pathname.startsWith('/v1/')) {
-    sendJson(res, 404, {
-      error: 'Use /anthropic/* or /v1/* on this proxy'
-    });
-    return;
-  }
+  applyCors(req, res);
 
   try {
-    const rawBody = ['POST', 'PUT', 'PATCH'].includes(req.method || '') ? await readBody(req) : '';
-    const parsedBody = rawBody ? JSON.parse(rawBody) : null;
-    logDebug('request', {
-      method: req.method,
-      path: requestUrl.pathname,
-      stream: Boolean(parsedBody?.stream),
-      model: parsedBody?.model,
-      tools: Array.isArray(parsedBody?.tools)
-        ? parsedBody.tools.map((tool) => tool?.name ?? tool?.function?.name).filter(Boolean)
-        : [],
-      messages: Array.isArray(parsedBody?.messages)
-        ? parsedBody.messages.slice(-3).map((message) => {
-          const entry = {
-            role: message?.role,
-            summary: summarizeMessageContent(message?.content)
-          };
-          // OpenAI assistant message may have tool_calls (critical for debugging)
-          if (Array.isArray(message?.tool_calls) && message.tool_calls.length > 0) {
-            entry.tool_calls = message.tool_calls.map((tc) => ({
-              id: tc?.id,
-              name: tc?.function?.name ?? tc?.name,
-              args: typeof tc?.function?.arguments === 'string' ? tc.function.arguments.slice(0, 100) : tc?.function?.arguments
-            }));
-          }
-          // OpenAI tool message has tool_call_id
-          if (message?.tool_call_id) {
-            entry.tool_call_id = message.tool_call_id;
-          }
-          return entry;
-        })
-        : []
-    });
-    const shouldStreamLocally = shouldHandleSyntheticStream(requestUrl.pathname, parsedBody);
-    const upstreamPath = mapUpstreamPath(requestUrl.pathname);
-    let bodyToNormalize = shouldStreamLocally ? { ...parsedBody, stream: false } : parsedBody;
-    if (parsedBody?.messages) {
-      const lastMsg = parsedBody.messages[parsedBody.messages.length - 1];
-      if (lastMsg?.role === 'assistant' && lastMsg?.content) {
-        const contentStr = typeof lastMsg.content === 'string' ? lastMsg.content : JSON.stringify(lastMsg.content);
-        logDebug('raw_assistant_content', contentStr.slice(0, 800));
-      }
-    }
-    const upstreamBody = parsedBody
-      ? injectSystemPromptForPath(
-        upstreamPath,
-        normalizeRequestTools(
-          normalizeRequestMessages(
-            maybeRewriteModel(bodyToNormalize, MODEL_ALIASES),
-            upstreamPath
-          ),
-          upstreamPath
-        )
-      )
-      : null;
-    if (upstreamBody?.messages) {
-      const lastMsg = upstreamBody.messages[upstreamBody.messages.length - 1];
-      if (lastMsg?.role === 'assistant') {
-        const content = lastMsg?.content;
-        if (Array.isArray(content)) {
-          logDebug('normalized_tool_calls', content.filter((b) => b?.type === 'tool_use').map((b) => ({ name: b.name, input: b.input })));
-        }
-      }
-    }
-    const encodedUpstreamBody = upstreamBody ? JSON.stringify(upstreamBody) : undefined;
-    const upstreamUrl = new URL(upstreamPath + requestUrl.search, UPSTREAM_BASE_URL);
-    const upstreamFetchOptions = {
-      method: req.method,
-      headers: buildUpstreamHeaders(req, encodedUpstreamBody ? Buffer.byteLength(encodedUpstreamBody) : null),
-      body: encodedUpstreamBody
-    };
+    if (method === 'OPTIONS') return corsPreflight(req, res);
 
-    // Ana loop: upstream'i cagir, normalize et. Bos cevap gelirse nudge'li
-    // follow-up ile yeniden cagir. Loop, suresi bittiginde veya hard limit'e
-    // ulastiginda durur (EMPTY_RESPONSE_BUDGET_MS butcesi kullanici bekleme
-    // toleransini asmaz). Conversation state DEGISMEZ - sadece request body'nin
-    // system bolumune gecici bir nudge eklenir.
-    // Son tool_result bir hata sonucu mu? Oyleyse retry ANLAMSIZ: upstream
-    // ayni hata sonucu gormekten cevap uretemiyor, biz kullaniciyi bekletmeyelim.
-    // Hemen fallback text'e dusulur ve client hatayi gorup dogru yol deneyebilir.
-    const priorToolResultWasError = SKIP_EMPTY_RETRY_ON_TOOL_ERROR && isLastToolResultAnError(parsedBody);
-    const effectiveMaxRetries = priorToolResultWasError ? 0 : EMPTY_RESPONSE_MAX_RETRIES;
-    const maxEmptyRetries = RETRY_ON_EMPTY_RESPONSE ? effectiveMaxRetries : 0;
-    const emptyRetryDeadline = Date.now() + EMPTY_RESPONSE_BUDGET_MS;
-    const priorToolCategories = collectPriorToolCategories(parsedBody);
-
-    if (priorToolResultWasError && RETRY_ON_EMPTY_RESPONSE) {
-      logDebug('empty_retry_skipped_tool_error', {
-        path: requestUrl.pathname,
-        reason: 'last tool_result matched error pattern; retry would loop on same error'
-      });
+    if (urlPath === '/healthz' || urlPath === '/health') {
+      return send(res, 200, { ok: true, ...summarize() });
     }
 
-    let upstreamResponse;
-    let contentType = '';
-    let upstreamText = '';
-    let payload = null;
-    let rawPayload = null;
-    let nonJsonPassthrough = false;
-    let lastWasEmpty = false;
-    // Her retry'da farkli nudge ile body'i yeniden uret. Ilk cagri (emptyAttempt=0)
-    // normal body kullanir; sonraki cagrilarda nudge eklenir.
-    let currentEncodedBody = encodedUpstreamBody;
-    let currentFetchOptions = upstreamFetchOptions;
-
-    for (let emptyAttempt = 0; emptyAttempt <= maxEmptyRetries; emptyAttempt += 1) {
-      upstreamResponse = await fetchUpstreamWithRetry(upstreamUrl, currentFetchOptions, `${req.method} ${upstreamPath}`);
-      contentType = upstreamResponse.headers.get('content-type') || '';
-      upstreamText = await upstreamResponse.text();
-
-      if (!contentType.includes('application/json')) {
-        nonJsonPassthrough = true;
-        break;
-      }
-
-      payload = upstreamText ? JSON.parse(upstreamText) : {};
-      rawPayload = payload;
-      payload = normalizeJsonPayload(requestUrl.pathname, payload, parsedBody);
-      payload = restorePresentedModel(parsedBody, payload);
-
-      const effectivelyEmpty = isEffectivelyEmpty(requestUrl.pathname, payload);
-      const noProgress = isNoProgressAssistantTurn(requestUrl.pathname, payload, parsedBody);
-      lastWasEmpty = noProgress;
-
-      // Basarili response + effectively empty → nudge'li yeniden cagri
-      const canRetry =
-        upstreamResponse.status >= 200 && upstreamResponse.status < 300 &&
-        RETRY_ON_EMPTY_RESPONSE &&
-        emptyAttempt < maxEmptyRetries &&
-        Date.now() < emptyRetryDeadline &&
-        noProgress;
-
-      if (canRetry) {
-        const nextAttempt = emptyAttempt + 1;
-        const nudge = buildEmptyRetryNudge(nextAttempt, priorToolCategories);
-        const nudgedBody = injectEmptyRetryNudgeIntoBody(parsedBody, upstreamBody, upstreamPath, nudge);
-        currentEncodedBody = JSON.stringify(nudgedBody);
-        currentFetchOptions = {
-          ...upstreamFetchOptions,
-          headers: buildUpstreamHeaders(req, Buffer.byteLength(currentEncodedBody)),
-          body: currentEncodedBody
-        };
-
-        logDebug('upstream_empty_payload_retry', {
-          attempt: nextAttempt,
-          path: requestUrl.pathname,
-          reason: effectivelyEmpty ? 'empty' : 'no_progress',
-          budget_remaining_ms: Math.max(0, emptyRetryDeadline - Date.now()),
-          raw_content_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.content) ? rawPayload.content.length : undefined,
-          raw_choices_length: typeof rawPayload === 'object' && Array.isArray(rawPayload?.choices) ? rawPayload.choices.length : undefined
-        });
-        await sleep(backoffDelay(nextAttempt));
-        continue;
-      }
-      break;
+    if (urlPath === '/' || urlPath === '/admin' || urlPath === '/admin/') {
+      return servePanel(req, res);
+    }
+    if (urlPath.startsWith('/admin/static/')) {
+      return serveStatic(req, res, urlPath);
+    }
+    if (urlPath.startsWith('/admin/api/')) {
+      return handleAdminApi(req, res, urlPath);
     }
 
-    // Retry'lar bitti ve cevap hala bos → AUTO-RECOVERY:
-    // lib/auto-recovery.js deterministik bir tool_use sentezler veya sessiz
-    // bir '.' text doner. Kullanici "empty response / model degistir"
-    // mesajini BIR DAHA GORMEZ. Session canli kalir.
-    if (
-      !nonJsonPassthrough &&
-      lastWasEmpty &&
-      upstreamResponse?.status >= 200 && upstreamResponse?.status < 300
-    ) {
-      const prevPayload = payload;
-      payload = injectEmptyResponseFallback(requestUrl.pathname, payload, parsedBody);
-      if (payload !== prevPayload) {
-        logDebug('auto_recovery_applied', {
-          path: requestUrl.pathname,
-          has_tool_use: Array.isArray(payload?.content)
-            ? payload.content.some((b) => b?.type === 'tool_use')
-            : (Array.isArray(payload?.choices) && payload.choices[0]?.message?.tool_calls?.length > 0),
-          kind: AUTO_RECOVERY_ENABLED && !EMPTY_RESPONSE_LEGACY_TEXT ? 'auto-recovery' : 'legacy-text'
-        });
-      }
+    if (urlPath === '/v1/models' && method === 'GET') {
+      if (!isAuthorized(req)) return unauthorized(res);
+      return handleListModels(req, res);
     }
 
-    if (nonJsonPassthrough) {
-      res.writeHead(upstreamResponse.status, {
-        'content-type': contentType || 'text/plain; charset=utf-8',
-        'access-control-allow-origin': '*'
-      });
-      res.end(upstreamText);
-      return;
-    }
-    if (
-      requestUrl.pathname.includes('/anthropic/') &&
-      Array.isArray(rawPayload?.content) &&
-      Array.isArray(payload?.content) &&
-      rawPayload.content.length > 0 &&
-      payload.content.length === 0
-    ) {
-      logDebug('normalization_emptied_content', {
-        path: requestUrl.pathname,
-        raw: rawPayload.content.map((block) => ({
-          type: block?.type,
-          name: block?.name,
-          text: typeof block?.text === 'string' ? block.text.slice(0, 200) : undefined
-        }))
-      });
-    }
-    logDebug('response', requestUrl.pathname.includes('/anthropic/')
-      ? {
-          stop_reason: payload?.stop_reason,
-          content: Array.isArray(payload?.content)
-            ? payload.content.map((block) => {
-                const entry = { type: block?.type };
-                if (block?.name !== undefined) entry.name = block.name;
-                if (typeof block?.text === 'string') entry.text = block.text.slice(0, 120);
-                if (block?.type === 'tool_use' && block?.input && typeof block.input === 'object') {
-                  // Tool_use input'unu kisaltilmis halde goster (debug icin kritik).
-                  entry.input = Object.fromEntries(
-                    Object.entries(block.input).map(([key, value]) => {
-                      if (typeof value === 'string') {
-                        return [key, value.length > 120 ? `${value.slice(0, 120)}...` : value];
-                      }
-                      return [key, value];
-                    })
-                  );
-                }
-                return entry;
-              })
-            : []
-        }
-      : {
-          choices: Array.isArray(payload?.choices)
-            ? payload.choices.map((choice) => ({
-                finish_reason: choice?.finish_reason,
-                content: typeof choice?.message?.content === 'string' ? choice.message.content.slice(0, 80) : choice?.message?.content,
-                tool_calls: Array.isArray(choice?.message?.tool_calls)
-                  ? choice.message.tool_calls.map((toolCall) => ({
-                      name: toolCall?.function?.name,
-                      arguments: typeof toolCall?.function?.arguments === 'string' && toolCall.function.arguments.length > 200
-                        ? `${toolCall.function.arguments.slice(0, 200)}...`
-                        : toolCall?.function?.arguments
-                    }))
-                  : []
-              }))
-            : []
-        });
-
-    if (requestUrl.pathname.endsWith('/models')) {
-      payload = appendAliasModels(payload);
+    if (urlPath === '/v1/chat/completions' && method === 'POST') {
+      if (!isAuthorized(req)) return unauthorized(res);
+      let body;
+      try { body = await readJsonBody(req); } catch (e) { return send(res, 400, { error: { message: 'bad json: ' + e.message } }); }
+      log.info(`POST /v1/chat/completions model=${body.model || '?'} stream=${!!body.stream} tools=${(body.tools||[]).length}`);
+      return handleOpenAiChatCompletions(req, res, body);
     }
 
-    if (shouldStreamLocally) {
-      if (requestUrl.pathname.includes('/anthropic/') || requestUrl.pathname === '/v1/messages') {
-        const sse = anthropicSseFromMessage(payload);
-        res.writeHead(upstreamResponse.status, {
-          'content-type': 'text/event-stream; charset=utf-8',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-          'access-control-allow-origin': '*',
-          'x-airforce-proxy-stream': 'synthetic'
-        });
-        res.end(sse);
-        return;
-      }
-
-      if (requestUrl.pathname.endsWith('/chat/completions')) {
-        const sse = openAiChatSseFromCompletion(payload);
-        res.writeHead(upstreamResponse.status, {
-          'content-type': 'text/event-stream; charset=utf-8',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-          'access-control-allow-origin': '*',
-          'x-airforce-proxy-stream': 'synthetic'
-        });
-        res.end(sse);
-        return;
-      }
+    if (urlPath === '/v1/messages' && method === 'POST') {
+      if (!isAuthorized(req)) return unauthorized(res);
+      let body;
+      try { body = await readJsonBody(req); } catch (e) { return send(res, 400, { error: { type: 'invalid_request_error', message: 'bad json: ' + e.message } }); }
+      log.info(`POST /v1/messages model=${body.model || '?'} stream=${!!body.stream} tools=${(body.tools||[]).length}`);
+      return handleAnthropicMessages(req, res, body);
     }
 
-    sendJson(res, upstreamResponse.status, payload);
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    logDebug('proxy_fatal', { path: requestUrl.pathname, message });
-    sendJson(res, 502, {
-      error: 'Proxy request failed',
-      details: message
-    });
+    return notFound(res);
+  } catch (err) {
+    log.error('server: unhandled error', { err: err.message, stack: err.stack?.split('\n')[0] });
+    if (!res.headersSent) return send(res, 500, { error: { message: err.message || 'internal error' } });
+  } finally {
+    const dur = Date.now() - start;
+    if (urlPath !== '/healthz') {
+      log.debug(`${method} ${urlPath} → ${res.statusCode} ${dur}ms`);
+    }
   }
 });
 
-const isMainModule = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+server.keepAliveTimeout = 30_000;
+server.headersTimeout = 35_000;
 
-if (isMainModule) {
-  // TCP keep-alive: istemcinin (Claude Code, OpenCode) ardisik request'lerinde
-  // bagaltinin yeniden acilmasini onler (TLS handshake + TCP SYN latency kazanci).
-  // Default 5s idle, biz 30s'ye cikaralim - ardisik tool_use turlarinda istemci
-  // genelde 1-2s icinde geri sorar, o pencerede bagaltimi tut.
-  server.keepAliveTimeout = 30_000;
-  server.headersTimeout = 35_000; // keepAlive + 5s buffer
-  server.listen(PORT, HOST, () => {
-    console.log(`Airforce compat proxy listening on http://${HOST}:${PORT}`);
-    console.log(`Upstream: ${UPSTREAM_BASE_URL}`);
-    console.log(`FAST_MODE: ${FAST_MODE ? 'on' : 'off'} | attempts=${UPSTREAM_MAX_ATTEMPTS} empty_retries=${EMPTY_RESPONSE_MAX_RETRIES} (budget ${EMPTY_RESPONSE_BUDGET_MS}ms${SKIP_EMPTY_RETRY_ON_TOOL_ERROR ? ', skip-on-tool-error' : ''}) timeout=${UPSTREAM_TIMEOUT_MS}ms`);
-  });
+server.listen(config.port, config.host, () => {
+  log.info(`airforce-bridge listening on http://${config.host}:${config.port}`, summarize());
+  scheduler.start();
+});
+
+function shutdown(sig) {
+  log.info(`received ${sig}, shutting down`);
+  scheduler.stop();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
 }
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('unhandledRejection', (err) => log.error('unhandledRejection', { err: err?.message || String(err) }));
