@@ -1,27 +1,38 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildProviderFromEnvConfig } from '../../lib/providers/factory.js';
+import { buildRouter, buildProviderInstance } from '../../lib/providers/factory.js';
 import { OpenaiCompatProvider } from '../../lib/providers/openai-compat.js';
 
-test('buildProviderFromEnvConfig creates OpenaiCompatProvider with api.airforce defaults', () => {
-  const cfg = {
-    airforceApiKey: 'sk-air-test',
-    upstreamBaseUrl: 'https://api.airforce',
-    upstreamTimeoutMs: 90000,
-    upstreamMaxAttempts: 2,
-    upstreamRetryBaseMs: 100,
-  };
-  const p = buildProviderFromEnvConfig(cfg);
-  assert.ok(p instanceof OpenaiCompatProvider);
-  assert.equal(p.id, 'airforce');
-  assert.equal(p.baseUrl, 'https://api.airforce');
-  assert.equal(p.apiKey, 'sk-air-test');
-  assert.equal(p.timeoutMs, 90000);
+test('buildProviderInstance creates OpenaiCompatProvider for openai-compat type', () => {
+  const inst = buildProviderInstance({
+    id: 'a', type: 'openai-compat', base_url: 'https://x', api_key: 'k', enabled: true,
+  });
+  assert.ok(inst instanceof OpenaiCompatProvider);
 });
 
-test('buildProviderFromEnvConfig throws when api key missing', () => {
+test('buildProviderInstance throws for unknown type', () => {
   assert.throws(
-    () => buildProviderFromEnvConfig({ airforceApiKey: '', upstreamBaseUrl: 'x' }),
-    /api key/i,
+    () => buildProviderInstance({ id: 'a', type: 'wat', base_url: 'https://x', api_key: 'k' }),
+    /unknown provider type/,
   );
+});
+
+test('buildRouter wires providers + registry + breakers', () => {
+  const cfg = {
+    schema_version: 1,
+    providers: [
+      {
+        id: 'a', type: 'openai-compat', base_url: 'https://a.example', api_key: 'k', enabled: true,
+        models: [{ upstream_id: 'm1', priority: 0, enabled: true }],
+      },
+    ],
+    aliases: {},
+    global: { default_model: 'm1', circuit_breaker: { fail_threshold: 5, open_seconds: 30 } },
+  };
+  const router = buildRouter(cfg);
+  assert.ok(router.registry);
+  assert.ok(router.breakers);
+  const entries = router.registry.resolve('m1');
+  assert.equal(entries.length, 1);
+  assert.equal(router.breakers.get('a').failThreshold, 5);
 });
