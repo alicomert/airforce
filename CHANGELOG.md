@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0] — Phase 3: Anthropic Native Provider
+
+- `lib/providers/anthropic-native.js` — `AnthropicNativeProvider` plugin (api.anthropic.com)
+- `lib/providers/format-conversion.js` — OpenAI ↔ Anthropic body/response converters (system extract, tool_use blocks, tools→input_schema, stop_reason map, usage map)
+- `lib/providers/factory.js` — `'anthropic-native'` tipi register
+- `lib/adapters/anthropic.js` — anthropic-native provider'ı önce dener; yoksa openai-compat'a fallback (api.airforce gibi)
+- v1 limit: text + tool_use + tool_result content blocks (image/document v2)
+- 15 yeni test (format-conversion 9 + anthropic-native 6 → toplam 93/93 PASS)
+
 ## [0.3.0] — Phase 2: Router & Registry
 
 - `lib/circuit-breaker.js` — `CircuitBreaker` (closed/open/half-open state machine) + `CircuitBreakerRegistry`

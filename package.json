@@ -1,6 +1,6 @@
 {
   "name": "airforce-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "api.airforce için tool-call destekli OpenAI + Anthropic uyumlu köprü sunucu",
   "type": "module",
   "private": true,
