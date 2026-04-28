@@ -399,6 +399,8 @@ systemd restart gerekmez.
 }
 ```
 
+`global.default_model` istemci `body.model` field'ını boş/eksik gönderdiğinde kullanılır (şimdiki davranışla aynı). `aliases` map'i resolution algoritmasında kontrol edilir; alias'ın hedef adı tekrar çözümlenir (alias → alias zincirine izin verilmez, tek adımda).
+
 ### 6.2 Atomic write
 
 `lib/store.js` write akışı:
@@ -623,7 +625,7 @@ test/
 ### 10.2 Yeni sistem (llm-bridge)
 
 - Boot'ta `data/providers.json` yoksa **ve** `AIRFORCE_API_KEY` env'de varsa → otomatik tek-provider config'e migrate.
-- `data/tool_capability.json` `data/capability.json`'a rename + key formatı `${providerId}/${modelId}`'a güncellenir.
+- `data/tool_capability.json` (eski format) varsa boot'ta okunur; her entry için key `<oldId>` → `airforce/<oldId>` olarak yeniden yazılır ve `data/capability.json` (schema_version: 2) olarak kaydedilir; eski dosya `.bak` uzantısıyla saklanır. İşlem otomatik ve tek seferlik.
 - Admin panel sekmeli yapıya geçer; eski URL'ler 200 döner ama yeni UI gösterir.
 
 ### 10.3 Backward compatibility
