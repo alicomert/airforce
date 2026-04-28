@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/parse.test.js test/inject.test.js test/serialize-history.test.js",
+    "test": "node --test test/parse.test.js test/inject.test.js test/serialize-history.test.js test/tier.test.js",
     "probe": "node -e \"import('./lib/probe.js').then(m => m.runProbe())\""
   },
   "engines": {

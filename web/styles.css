@@ -178,6 +178,9 @@ table tbody tr:hover { background: var(--bg-3); }
 .badge-warn { background: rgba(251, 191, 36, 0.12); color: var(--yellow); border-color: rgba(251, 191, 36, 0.3); }
 .badge-err { background: rgba(248, 113, 113, 0.12); color: var(--red); border-color: rgba(248, 113, 113, 0.3); }
 .badge-payg { background: rgba(124, 91, 255, 0.12); color: var(--accent-2); border-color: rgba(124, 91, 255, 0.3); }
+.badge-tier-free { background: rgba(74, 222, 128, 0.12); color: var(--green); border-color: rgba(74, 222, 128, 0.3); }
+.badge-tier-premium { background: rgba(251, 146, 60, 0.12); color: var(--orange); border-color: rgba(251, 146, 60, 0.3); }
+.badge-tier-p2g { background: rgba(124, 91, 255, 0.12); color: var(--accent-2); border-color: rgba(124, 91, 255, 0.3); }
 
 input, select {
   background: var(--bg-3);

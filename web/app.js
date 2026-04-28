@@ -181,7 +181,7 @@ async function refreshState() {
   try {
     const s = await api('GET', '/admin/api/state');
     setStatus(s.probe.running ? 'warn' : 'ok', s.probe.running ? 'probe çalışıyor' : `${s.config.upstreamBaseUrl}`);
-    renderCapability(s.probe.snapshot);
+    renderCapability(s.probe.snapshot, s.rate_limit);
     renderKeys(s.keys);
     renderConfig(s.config);
   } catch (e) {
@@ -193,26 +193,37 @@ function renderConfig(cfg) {
   $('#config-dump').textContent = JSON.stringify(cfg, null, 2);
 }
 
-function renderCapability(snap) {
+function renderCapability(snap, budget) {
   const models = snap?.models || {};
   const entries = Object.entries(models);
-  let capable = 0, incompat = 0, payg = 0, skipped = 0;
+  let capable = 0, freeOk = 0, premiumOk = 0, incompat = 0, skipped = 0;
   for (const [, v] of entries) {
-    if (v.status === 'ok') capable++;
+    if (v.status === 'ok') {
+      capable++;
+      if (v.tier === 'free') freeOk++;
+      else if (v.tier === 'premium') premiumOk++;
+    }
     if (v.status === 'incompatible') incompat++;
-    if (v.status === 'payg') payg++;
     if (v.status === 'skipped') skipped++;
   }
   $('#stat-capable').textContent = capable;
+  $('#stat-free').textContent = freeOk;
+  $('#stat-premium').textContent = premiumOk;
   $('#stat-incompat').textContent = incompat;
-  $('#stat-payg').textContent = payg;
   $('#stat-skipped').textContent = skipped;
   $('#stat-last-probe').textContent = snap?.last_run_iso ? timeAgo(snap.last_run_iso) : 'henüz çalışmadı';
+  if (budget) {
+    $('#stat-budget').textContent = `${budget.remaining}/${budget.cap}`;
+    $('#stat-budget').title = `son ${Math.round((budget.window_age_ms || 0)/1000)}s'de ${budget.spent} mult harcandı, dakika başı ${budget.cap}`;
+  } else {
+    $('#stat-budget').textContent = '–';
+  }
 
   const filterText = ($('#model-filter').value || '').toLowerCase();
   const tbody = $('#model-table tbody');
   tbody.innerHTML = '';
 
+  const tierOrder = { free: 0, premium: 1, p2g: 2, unknown: 3 };
   entries
     .sort(([a, av], [b, bv]) => {
       // 1) capable (status=ok) en üstte
@@ -220,12 +231,17 @@ function renderCapability(snap) {
       const okB = bv.status === 'ok' ? 0 : 1;
       if (okA !== okB) return okA - okB;
 
-      // 2) latency ascending (hızlı en üstte). null/undefined latency en sona.
+      // 2) tier önceliği: free → premium → p2g (kullanıcı önce free görmek istiyor)
+      const tA = tierOrder[av.tier] ?? 9;
+      const tB = tierOrder[bv.tier] ?? 9;
+      if (tA !== tB) return tA - tB;
+
+      // 3) latency ascending (hızlı en üstte). null/undefined latency en sona.
       const lA = Number.isFinite(av.latency_ms) ? av.latency_ms : Number.POSITIVE_INFINITY;
       const lB = Number.isFinite(bv.latency_ms) ? bv.latency_ms : Number.POSITIVE_INFINITY;
       if (lA !== lB) return lA - lB;
 
-      // 3) son çare: id alfabetik
+      // 4) son çare: id alfabetik
       return a.localeCompare(b);
     })
     .forEach(([id, v]) => {
@@ -234,6 +250,8 @@ function renderCapability(snap) {
       tr.innerHTML = `
         <td><code>${escapeHtml(id)}</code></td>
         <td>${escapeHtml(v.owned_by || '–')}</td>
+        <td>${tierBadge(v.tier)}</td>
+        <td class="muted">${formatMult(v.multiplier)}</td>
         <td>${statusBadge(v.status)}</td>
         <td>${boolBadge(v.xml)}</td>
         <td>${v.latency_ms != null ? v.latency_ms + ' ms' : '–'}</td>
@@ -257,6 +275,17 @@ function statusBadge(s) {
 }
 function boolBadge(b) {
   return b ? '<span class="badge badge-ok">✓</span>' : '<span class="badge muted">–</span>';
+}
+function tierBadge(t) {
+  if (t === 'free') return '<span class="badge badge-tier-free">free</span>';
+  if (t === 'premium') return '<span class="badge badge-tier-premium">premium</span>';
+  if (t === 'p2g') return '<span class="badge badge-tier-p2g">p2g</span>';
+  return '<span class="badge muted">?</span>';
+}
+function formatMult(m) {
+  if (m == null) return '<span title="api.airforce multiplier alanı boş — varsayılan free">×1*</span>';
+  if (m === 0 || m === 1) return '×1';
+  return '×' + m;
 }
 
 // --- Keys tab ---

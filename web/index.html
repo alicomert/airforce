@@ -58,16 +58,24 @@
           <span id="stat-capable" class="stat-value">–</span>
         </div>
         <div class="card stat">
+          <span class="stat-label">Free capable</span>
+          <span id="stat-free" class="stat-value">–</span>
+        </div>
+        <div class="card stat">
+          <span class="stat-label">Premium capable</span>
+          <span id="stat-premium" class="stat-value">–</span>
+        </div>
+        <div class="card stat">
           <span class="stat-label">Incompatible</span>
           <span id="stat-incompat" class="stat-value">–</span>
         </div>
         <div class="card stat">
-          <span class="stat-label">PAYG / Premium</span>
-          <span id="stat-payg" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
           <span class="stat-label">Skipped</span>
           <span id="stat-skipped" class="stat-value">–</span>
+        </div>
+        <div class="card stat">
+          <span class="stat-label">Rate budget</span>
+          <span id="stat-budget" class="stat-value">–</span>
         </div>
         <div class="card stat">
           <span class="stat-label">Last probe</span>
@@ -91,6 +99,22 @@
           Upstream'in ürettiği "tool_calls" benzeri JSON field'lerine <b>güvenmiyoruz</b> — gateway resmi destek
           vermediği için tutarsız ya da yanıltıcı olabiliyor. Köprü her zaman text + XML'i kanon kabul eder.
         </div>
+
+        <h3 style="margin:16px 0 8px;font-size:14px;">Tier sınıflandırması (multiplier'a göre):</h3>
+        <ul class="legend-list">
+          <li>
+            <span class="badge badge-tier-free">free</span>
+            <span><b>multiplier ≤ 1</b> — ücretsiz hesapta sınırsız çalışır (rate-limit dakikada toplam multiplier bütçesi kadar). Probe önce bunlar için yapılır.</span>
+          </li>
+          <li>
+            <span class="badge badge-tier-premium">premium</span>
+            <span><b>multiplier 2–10</b> — paralı ama Pay-As-You-Go değil; aboneliğe dahil olabilir. Free probe'ta atlanır (PROBE_TIER=premium ile dahil olur).</span>
+          </li>
+          <li>
+            <span class="badge badge-tier-p2g">p2g</span>
+            <span><b>multiplier > 10</b> — Pay-As-You-Go, kredi gerektirir. PROBE_TIER=all ile dahil olur.</span>
+          </li>
+        </ul>
 
         <h3 style="margin:16px 0 8px;font-size:14px;">Probe sonuç durumları:</h3>
         <ul class="legend-list">
@@ -134,6 +158,8 @@
               <tr>
                 <th>Model ID</th>
                 <th>Owner</th>
+                <th title="multiplier=1 free, 2-10 premium, >10 p2g">Tier</th>
+                <th title="api.airforce'taki kredi maliyeti çarpanı (1 multiplier = 1 kredi)">Mult</th>
                 <th>Durum</th>
                 <th title="Bridge XML akışı bu modelde çalışıyor mu?">XML akışı</th>
                 <th>Latency</th>
