@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.0] — Phase 5: Multi-provider Probe (native + xml)
+
+- `lib/probe.js` — her `(provider, model)` çifti için **iki test**: native tool calling (provider'a `tools` field gider; cevapta `native_tool_calls` well-formed mi) + XML inject (mevcut). Capability snapshot: `native: bool`, `xml: bool`, `latency_ms` (öncelik native'in latency'si).
+- Native test sadece `supportsNativeTools()` true dönen provider'larda çalışır (openai-compat, anthropic-native).
+- Bucket charge per test (rate limit korunur).
+
 ## [0.6.0] — Phase 4b: Built-in Admin Chatbot
 
 - `lib/admin-chatbot/{tool-dispatcher,system-prompt,chatbot-router,audit-log}.js`
