@@ -3,8 +3,9 @@
 import { initProviders } from './tabs/providers.js';
 import { initModels } from './tabs/models.js';
 import { initLogs } from './tabs/logs.js';
+import { initChat } from './tabs/chat.js';
 
-const TABS = { providers: initProviders, models: initModels, logs: initLogs };
+const TABS = { providers: initProviders, models: initModels, logs: initLogs, chat: initChat };
 
 let token = sessionStorage.getItem('llm-bridge-token') || null;
 

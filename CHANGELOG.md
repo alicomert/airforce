@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.6.0] — Phase 4b: Built-in Admin Chatbot
+
+- `lib/admin-chatbot/{tool-dispatcher,system-prompt,chatbot-router,audit-log}.js`
+- `lib/admin-chatbot/tools/{system-status,repo-access,provider-mutate,model-mutate,actions}.js` — 24 tool toplam
+- `POST /admin/api/chat` — SSE streaming (events: `meta`, `text`, `tool_use`, `tool_result`, `done`, `error`)
+- `web/tabs/chat.js` — vanilla JS chat UI; localStorage history; model picker (`/v1/models`'tan beslenir)
+- `data/audit-log.json` — NDJSON; sadece mutating tool çağrıları; api_key/secret alanları `<redacted>`
+- Multi-turn loop max 10 turn; tool result max 50KB
+- Repo erişimi whitelist'le sınırlı (`lib/`, `docs/`, `web/`, `test/`, root files); `.env`, `data/`, `node_modules/` yasak
+- System prompt runtime context içerir (provider listesi, son probe, son 5 log satırı)
+
 ## [0.5.0] — Phase 4a: Admin Panel Core
 
 - Sekmeli admin panel (Providers / Models / Logs)
