@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.5.0] — Phase 4a: Admin Panel Core
+
+- Sekmeli admin panel (Providers / Models / Logs)
+- `lib/providers/config-schema.js` — provider/model/file validation
+- `lib/admin-router.js` — ~15 yeni endpoint (provider CRUD, models bulk, discover, breaker reset, breakers list, aliases, export/import)
+- `lib/providers/factory.js` — `invalidateRouterCache()` public (admin mutations sonrası çağrılır)
+- `web/index.html` + `web/app.js` — yeniden yazıldı, basit login + tab router
+- `web/tabs/{providers,models,logs}.js` — yeni vanilla JS modülleri (no framework)
+- `web/styles.css` — palette korundu, sade ve tutarlı sekmeli yapı
+- Hot-reload: panelden provider/model değişikliği → cache invalidate → sonraki istek yeni state
+- 9 yeni test (config-schema 8 + hot-reload 1; HTTP integration test'leri smoke ile doğrulandı)
+
 ## [0.4.0] — Phase 3: Anthropic Native Provider
 
 - `lib/providers/anthropic-native.js` — `AnthropicNativeProvider` plugin (api.anthropic.com)

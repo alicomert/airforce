@@ -1,241 +1,36 @@
 <!doctype html>
 <html lang="tr">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Airforce Bridge — Panel</title>
-  <link rel="stylesheet" href="/admin/static/styles.css" />
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>llm-bridge admin</title>
+<link rel="stylesheet" href="/admin/static/styles.css" />
 </head>
 <body>
-  <div id="login" class="login hidden">
-    <div class="login-card">
-      <h1>Airforce Bridge</h1>
-      <p class="muted" id="login-mode-text">Panel girişi</p>
-
-      <!-- Password mode (varsayılan; sunucu desteklemiyorsa app.js gizler) -->
-      <div id="login-pw-mode">
-        <input id="username-input" type="text" placeholder="kullanıcı adı (örn: admin)" autocomplete="username" />
-        <input id="password-input" type="password" placeholder="şifre" autocomplete="current-password" />
-      </div>
-
-      <!-- Token mode (sunucuda parola desteklenmiyorsa) -->
-      <div id="login-token-mode" class="hidden">
-        <input id="token-input" type="password" placeholder="ADMIN_TOKEN" autocomplete="off" />
-      </div>
-
-      <button id="login-btn" class="primary">Giriş yap</button>
-      <p class="error" id="login-error"></p>
-      <p class="muted" id="login-toggle" style="margin-top:14px;font-size:12px;cursor:pointer;text-decoration:underline;display:none;">
-        Token ile gir
-      </p>
-    </div>
+<div id="login" class="login-screen">
+  <div class="login-card">
+    <h1>llm-bridge</h1>
+    <input id="login-user" type="text" placeholder="username" autocomplete="username" />
+    <input id="login-pass" type="password" placeholder="password" autocomplete="current-password" />
+    <button id="login-btn" class="primary">Login</button>
+    <p class="login-error" id="login-error"></p>
   </div>
+</div>
 
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo">⚡</span>
-      <strong>Airforce Bridge</strong>
-      <span id="status-dot" class="dot dot-pending" title="durum"></span>
-      <span id="status-text" class="muted">bağlanıyor…</span>
-    </div>
-    <nav class="tabs">
-      <button class="tab active" data-tab="capability">Capability</button>
-      <button class="tab" data-tab="keys">API Keys</button>
-      <button class="tab" data-tab="logs">Logs</button>
-      <button class="tab" data-tab="settings">Settings</button>
+<div id="app" class="hidden">
+  <header>
+    <h1>llm-bridge</h1>
+    <nav id="tabs">
+      <button data-tab="providers" class="active">Providers</button>
+      <button data-tab="models">Models</button>
+      <button data-tab="logs">Logs</button>
     </nav>
-    <div class="actions">
-      <button id="probe-run" class="primary small">Probe çalıştır</button>
-      <button id="logout" class="ghost small">Çıkış</button>
-    </div>
+    <span class="grow"></span>
+    <button id="logout-btn" class="ghost">Logout</button>
   </header>
+  <main id="content"></main>
+</div>
 
-  <main>
-    <section id="tab-capability" class="tab-pane active">
-      <div class="row">
-        <div class="card stat">
-          <span class="stat-label">Tool-capable</span>
-          <span id="stat-capable" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
-          <span class="stat-label">Free capable</span>
-          <span id="stat-free" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
-          <span class="stat-label">Premium capable</span>
-          <span id="stat-premium" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
-          <span class="stat-label">Incompatible</span>
-          <span id="stat-incompat" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
-          <span class="stat-label">Skipped</span>
-          <span id="stat-skipped" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
-          <span class="stat-label">Rate budget</span>
-          <span id="stat-budget" class="stat-value">–</span>
-        </div>
-        <div class="card stat">
-          <span class="stat-label">Last probe</span>
-          <span id="stat-last-probe" class="stat-value">–</span>
-        </div>
-      </div>
-      <div class="card legend">
-        <h2>Sistem nasıl çalışıyor?</h2>
-
-        <div class="callout-info">
-          <b>Tool call'u 100% biz çalıştırıyoruz.</b> api.airforce gateway'i resmi olarak hiçbir model için
-          tool calling desteklemiyor (panel'deki "Function Calling" filtresi 0 model döndürüyor). Bu yüzden
-          tüm akışı bu köprü uniform şekilde yürütüyor:
-          <ol style="margin:8px 0 0 18px;padding:0;">
-            <li>İstemci tools listesini bu köprüye gönderir.</li>
-            <li>Köprü tools'u request'ten <b>çıkarır</b>; yerine system prompt'a <code>&lt;tool_calls&gt;</code> XML şeması <b>enjekte eder</b>.</li>
-            <li>Upstream model XML formatında cevap verir (text içinde).</li>
-            <li>Köprü XML'i <b>parse eder</b>, OpenAI/Anthropic native <code>tool_calls</code> / <code>tool_use</code> formatına çevirir.</li>
-            <li>İstemci normal tool akışı görmüş gibi devam eder.</li>
-          </ol>
-          Upstream'in ürettiği "tool_calls" benzeri JSON field'lerine <b>güvenmiyoruz</b> — gateway resmi destek
-          vermediği için tutarsız ya da yanıltıcı olabiliyor. Köprü her zaman text + XML'i kanon kabul eder.
-        </div>
-
-        <h3 style="margin:16px 0 8px;font-size:14px;">Tier sınıflandırması (multiplier'a göre):</h3>
-        <ul class="legend-list">
-          <li>
-            <span class="badge badge-tier-free">free</span>
-            <span><b>multiplier ≤ 1</b> — ücretsiz hesapta sınırsız çalışır (rate-limit dakikada toplam multiplier bütçesi kadar). Probe önce bunlar için yapılır.</span>
-          </li>
-          <li>
-            <span class="badge badge-tier-premium">premium</span>
-            <span><b>multiplier 2–10</b> — paralı ama Pay-As-You-Go değil; aboneliğe dahil olabilir. Free probe'ta atlanır (PROBE_TIER=premium ile dahil olur).</span>
-          </li>
-          <li>
-            <span class="badge badge-tier-p2g">p2g</span>
-            <span><b>multiplier > 10</b> — Pay-As-You-Go, kredi gerektirir. PROBE_TIER=all ile dahil olur.</span>
-          </li>
-        </ul>
-
-        <h3 style="margin:16px 0 8px;font-size:14px;">Probe sonuç durumları:</h3>
-        <ul class="legend-list">
-          <li>
-            <span class="badge badge-ok">capable</span>
-            <span><b>Bridge bu modelde tool call'u çalıştırabiliyor.</b> Probe sırasında system prompt'a XML şeması
-            enjekte edildi, model doğru formatta tool çağrısı üretti, parse başarılı. <code>/v1/models</code>'da gösterilir.</span>
-          </li>
-          <li>
-            <span class="badge badge-err">incompat</span>
-            <span>Model XML şemasını anlamıyor, boş döndürüyor, "tool yok" diyor, ya da timeout/429 alıyor.
-            Bridge bu modeli işe alamıyor — listede gösterilmez.</span>
-          </li>
-          <li>
-            <span class="badge badge-payg">payg</span>
-            <span>Pay-As-You-Go / premium — free hesapta kullanılamıyor (gateway "Pay-As-You-Go" mesajı dönüyor). Listede gizli.</span>
-          </li>
-          <li>
-            <span class="badge">skipped</span>
-            <span>Probe filtresine takıldı (image-only, midjourney, suno, vb. — chat dışı veya paid suffix'li modeller).</span>
-          </li>
-          <li>
-            <span style="color:var(--green)">✓</span>
-            <span>"XML" kolonu — son probe'ta XML akışı bu model için <b>canlı doğrulandı</b>.</span>
-          </li>
-          <li>
-            <span class="muted">–</span>
-            <span>XML akışı bu modelde çalışmadı.</span>
-          </li>
-        </ul>
-      </div>
-
-      <div class="card">
-        <div class="card-header">
-          <h2>Models <span class="muted" style="font-weight:400;font-size:13px;">(en hızlıdan en yavaşa sıralı)</span></h2>
-          <input id="model-filter" placeholder="filtrele…" />
-        </div>
-        <div class="table-wrap">
-          <table id="model-table">
-            <thead>
-              <tr>
-                <th>Model ID</th>
-                <th>Owner</th>
-                <th title="multiplier=1 free, 2-10 premium, >10 p2g">Tier</th>
-                <th title="api.airforce'taki kredi maliyeti çarpanı (1 multiplier = 1 kredi)">Mult</th>
-                <th>Durum</th>
-                <th title="Bridge XML akışı bu modelde çalışıyor mu?">XML akışı</th>
-                <th>Latency</th>
-                <th>Checked</th>
-              </tr>
-            </thead>
-            <tbody></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <section id="tab-keys" class="tab-pane">
-      <div class="card">
-        <div class="card-header">
-          <h2>Bridge API Keys</h2>
-          <div class="inline">
-            <input id="new-key-label" placeholder="etiket (örn: claude-code)" />
-            <button id="new-key-btn" class="primary small">Yeni key</button>
-          </div>
-        </div>
-        <div id="key-newly-created" class="callout hidden"></div>
-        <table id="keys-table">
-          <thead>
-            <tr><th>Etiket</th><th>Key</th><th>Oluşturuldu</th><th>Son kullanım</th><th></th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section id="tab-logs" class="tab-pane">
-      <div class="card">
-        <div class="card-header">
-          <h2>Logs</h2>
-          <div class="inline">
-            <label class="muted">filtre:</label>
-            <select id="log-level">
-              <option value="">all</option>
-              <option value="trace">trace</option>
-              <option value="debug">debug</option>
-              <option value="info">info</option>
-              <option value="warn">warn</option>
-              <option value="error">error</option>
-            </select>
-            <label class="muted"><input type="checkbox" id="log-autoscroll" checked /> auto-scroll</label>
-            <button id="logs-clear" class="ghost small">Temizle</button>
-          </div>
-        </div>
-        <pre id="logs"></pre>
-      </div>
-    </section>
-
-    <section id="tab-settings" class="tab-pane">
-      <div class="card">
-        <h2>Runtime Config</h2>
-        <pre id="config-dump" class="code"></pre>
-      </div>
-      <div class="card">
-        <h2>Endpoint kullanımı</h2>
-        <p class="muted">İstemcileri bu sunucuya yönlendir. Authorization Bearer ya da x-api-key olarak bridge key gönder.</p>
-        <pre class="code">OpenAI uyumlu:
-  POST /v1/chat/completions
-  GET  /v1/models
-
-Anthropic uyumlu:
-  POST /v1/messages
-  (anthropic-version header'ı opsiyonel)
-
-Health:
-  GET  /healthz
-</pre>
-      </div>
-    </section>
-  </main>
-
-  <script src="/admin/static/app.js"></script>
+<script type="module" src="/admin/static/app.js"></script>
 </body>
 </html>
