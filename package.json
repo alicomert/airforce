@@ -1,6 +1,6 @@
 {
   "name": "airforce-bridge",
-  "version": "0.1.0",
+  "version": "0.7.0",
   "description": "api.airforce için tool-call destekli OpenAI + Anthropic uyumlu köprü sunucu",
   "type": "module",
   "private": true,
@@ -8,7 +8,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "test": "node --test test/parse.test.js test/inject.test.js test/serialize-history.test.js test/tier.test.js",
+    "test": "node --test test/*.test.js test/providers/*.test.js test/integration/*.test.js test/admin/*.test.js",
     "probe": "node -e \"import('./lib/probe.js').then(m => m.runProbe())\""
   },
   "engines": {

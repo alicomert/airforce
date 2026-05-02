@@ -10,3 +10,4 @@ data/
 models.json
 probe_*.json
 /tmp/
+.env
