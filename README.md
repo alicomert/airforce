@@ -1,121 +1,238 @@
-# Airforce Bridge
+# LLM Bridge
 
-`api.airforce` üzerine kurulu, **tool call destekli** OpenAI + Anthropic uyumlu köprü sunucu.
+Kisisel kullanim icin tasarlanmis, OpenAI ve Anthropic uyumlu coklu LLM API koprusu.
 
-**Önemli**: `api.airforce` gateway'i resmi olarak hiçbir model için tool calling desteklemez (panel'deki "Function Calling" filtresi 0 model döndürür). Tool call sistemini tamamen bu köprü kuruyor:
+Bu proje farkli LLM servislerini tek bir API catisi altinda toplar. Amac; OpenAI uyumlu istemciler, Anthropic uyumlu istemciler, agent araclari ve tool/function calling kullanan uygulamalar icin tek bir yerel endpoint saglamaktir.
 
-- Bazı upstream provider modelleri (GLM, Llama, GPT-OSS, vb.) **kendi yetenekleriyle** `tool_calls` field'ini doğal olarak doldurur ve gateway transparent geçirir → biz buna **passthrough** diyoruz.
-- Diğer modeller hiçbir tool field'i dönmez → bu durumda system-prompt'a `<tool_calls>` XML şeması enjekte edip, model çıktısındaki XML'i parse edip OpenAI/Anthropic native formatına çeviriyoruz.
+## Ne Ise Yarar?
 
-Her iki yolda da fiili tool-call mantığı bu köprüde yaşar. Ek olarak, **günde bir kere** tüm modelleri probe eder; passthrough vs XML desteğini ölçer; sadece capable modelleri `/v1/models`'da sunar.
+- Birden fazla upstream provider'i tek API uzerinden kullanma
+- OpenAI uyumlu `/v1/chat/completions`, `/v1/responses`, `/v1/models` endpointleri
+- Anthropic uyumlu `/v1/messages` endpointi
+- Tool/function calling destegi
+- Native tool-call donen modellerde passthrough
+- Native tool-call desteklemeyen modellerde XML tabanli tool-call parse/translate katmani
+- Model alias, provider onceligi ve fallback
+- Provider hata izolasyonu icin circuit breaker
+- Basit rate limit ve probe altyapisi
+- Admin paneli ile model, provider, log ve probe takibi
+- Stream isteyen istemciler icin synthetic SSE cikisi
 
-## Hızlı başlangıç
+## Temel Fikir
+
+LLM Bridge istemciler ile upstream LLM servisleri arasinda duran kisisel bir gateway'dir.
+
+```text
+Client / Agent / SDK
+        |
+        v
+LLM Bridge
+  - auth
+  - routing
+  - model aliases
+  - tool-call engine
+  - provider fallback
+        |
+        v
+OpenAI-compatible or Anthropic-compatible providers
+```
+
+Istemci tarafinda tek bir `base_url` ve tek bir API key kullanilir. Bridge, istegi uygun provider'a yonlendirir, gerekirse tool-call formatini donusturur ve cevabi istemcinin bekledigi OpenAI veya Anthropic formatinda dondurur.
+
+## Desteklenen Arayuzler
+
+| Arayuz | Endpoint | Aciklama |
+|---|---|---|
+| Health | `GET /healthz` | Servis durumu |
+| Models | `GET /v1/models` | Bridge tarafindan sunulan modeller |
+| OpenAI Chat | `POST /v1/chat/completions` | OpenAI uyumlu chat completions |
+| OpenAI Responses | `POST /v1/responses` | OpenAI Responses uyumlu endpoint |
+| Anthropic Messages | `POST /v1/messages` | Anthropic Messages uyumlu endpoint |
+| Admin UI | `GET /admin` | Web panel |
+| Admin API | `/admin/api/*` | Panel ve yonetim API'leri |
+
+## Kurulum
+
+Gereksinim: Node.js 20 veya uzeri.
 
 ```bash
-cp .env.example .env
-# .env'de AIRFORCE_API_KEY ve BRIDGE_API_KEYS / ADMIN_TOKEN düzenle
+npm install
 npm start
 ```
 
-Sunucu varsayılan `http://0.0.0.0:2393` üzerinde dinler.
+Varsayilan adres:
 
-- **Panel**: `http://localhost:2393/admin`
-- **Health**: `http://localhost:2393/healthz`
+```text
+http://0.0.0.0:2393
+```
 
-## Endpoint'ler
-
-İstemcide Bearer veya `x-api-key` olarak `BRIDGE_API_KEYS`'ten birini gönder.
+Lokal test:
 
 ```bash
-# OpenAI uyumlu
+curl http://localhost:2393/healthz
+```
+
+## Ortam Degiskenleri
+
+Asgari olarak bridge icin bir istemci anahtari ve en az bir provider konfiguru gerekir.
+
+`.env` dosyasi ornegi:
+
+```env
+PORT=2393
+HOST=0.0.0.0
+
+BRIDGE_API_KEYS=sk-local-example
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change-me
+
+TOOL_ENGINE_FORCE_XML=1
+TOOL_ENGINE_FORMAT=canonical
+
+PROBE_INTERVAL_HOURS=24
+PROBE_ON_BOOT=1
+RATE_LIMIT_MULT_PER_MIN=10
+LOG_LEVEL=info
+```
+
+Notlar:
+
+- `BRIDGE_API_KEYS`, istemcilerin `Authorization: Bearer ...` veya `x-api-key` ile kullanacagi bridge anahtarlaridir.
+- `ADMIN_USERNAME` ve `ADMIN_PASSWORD`, web panel girisi icindir.
+- `TOOL_ENGINE_FORCE_XML=1`, tum modellerde bridge'in kendi XML tool-call akisini kullanmasini saglar.
+- `TOOL_ENGINE_FORCE_XML=0`, native tool-call destekleyen modellerde passthrough davranisini tercih eder.
+
+## Provider Konfigurasyonu
+
+Provider'lar `data/providers.json` icinden okunur. Iki provider tipi desteklenir:
+
+- `openai-compat`: OpenAI uyumlu `/v1/chat/completions` ve `/v1/models` sunan servisler
+- `anthropic-native`: Anthropic uyumlu Messages API sunan servisler
+
+Ornek:
+
+```json
+{
+  "schema_version": 1,
+  "global": {
+    "circuit_breaker": {
+      "fail_threshold": 3,
+      "open_seconds": 60
+    }
+  },
+  "aliases": {
+    "fast": "provider-a/model-small",
+    "smart": [
+      "provider-b/model-large",
+      "provider-a/model-large"
+    ]
+  },
+  "providers": [
+    {
+      "id": "provider-a",
+      "type": "openai-compat",
+      "enabled": true,
+      "base_url": "https://example-openai-compatible.local/v1",
+      "api_key": "sk-provider-key",
+      "models": [
+        {
+          "upstream_id": "model-small",
+          "presented_id": "fast-model",
+          "enabled": true,
+          "priority": 10
+        }
+      ]
+    },
+    {
+      "id": "provider-b",
+      "type": "anthropic-native",
+      "enabled": true,
+      "base_url": "https://example-anthropic-compatible.local",
+      "api_key": "sk-provider-key",
+      "models": [
+        {
+          "upstream_id": "model-large",
+          "presented_id": "smart-model",
+          "enabled": true,
+          "priority": 20
+        }
+      ]
+    }
+  ]
+}
+```
+
+Model cagirma sekilleri:
+
+- Kisa ad: `fast-model`
+- Alias: `fast`
+- Provider prefix'i ile kesin hedef: `provider-a/model-small`
+
+Birden fazla provider ayni model adini sunuyorsa bridge `priority` degerine gore siralar ve hata halinde uygun fallback adayina gecer.
+
+## Istemci Entegrasyonu
+
+OpenAI uyumlu istemciler:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:2393/v1
+export OPENAI_API_KEY=sk-local-example
+```
+
+Anthropic uyumlu istemciler:
+
+```bash
+export ANTHROPIC_BASE_URL=http://localhost:2393
+export ANTHROPIC_API_KEY=sk-local-example
+```
+
+## Ornek Istekler
+
+OpenAI Chat Completions:
+
+```bash
 curl http://localhost:2393/v1/chat/completions \
   -H "Authorization: Bearer $BRIDGE_KEY" \
   -H "content-type: application/json" \
-  -d '{"model":"glm-4.6","messages":[...],"tools":[...]}'
+  -d '{
+    "model": "fast",
+    "messages": [
+      { "role": "user", "content": "Merhaba" }
+    ]
+  }'
+```
 
-# Anthropic uyumlu
+Anthropic Messages:
+
+```bash
 curl http://localhost:2393/v1/messages \
   -H "x-api-key: $BRIDGE_KEY" \
   -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" \
-  -d '{"model":"glm-4.6","max_tokens":1024,"messages":[...],"tools":[...]}'
-
-# Models (sadece tool-capable olanlar)
-curl http://localhost:2393/v1/models -H "Authorization: Bearer $BRIDGE_KEY"
+  -d '{
+    "model": "smart",
+    "max_tokens": 1024,
+    "messages": [
+      { "role": "user", "content": "Merhaba" }
+    ]
+  }'
 ```
 
-## İstemci entegrasyonları
-
-**Codex CLI / OpenAI SDK**: `OPENAI_BASE_URL=http://localhost:2393/v1` ve `OPENAI_API_KEY=$BRIDGE_KEY` ayarla.
-
-**Claude Code / Anthropic SDK**: `ANTHROPIC_BASE_URL=http://localhost:2393` ve `ANTHROPIC_API_KEY=$BRIDGE_KEY`. (Claude Code, `/v1/messages` path'ini kendi ekliyor.)
-
-## Mimari
-
-```
-İstemci → /v1/chat/completions   ──▶ OpenAI adapter
-                                    │
-İstemci → /v1/messages           ──▶ Anthropic adapter
-                                    │
-                                    ▼
-                            tool-engine/inject.js
-                                    │  (system'e XML şema)
-                                    ▼
-                            tool-engine/serialize-history.js
-                                    │  (önceki tool_calls/result'ları XML'e indir)
-                                    ▼
-                            upstream.js (api.airforce, non-stream)
-                                    │
-                                    ▼
-                            tool-engine/parse.js + anti-leak.js
-                                    │  (text'ten <tool_calls> çıkar)
-                                    ▼
-                            tool-engine/translate.js
-                                    │  (OpenAI/Anthropic native formata çevir)
-                                    ▼
-                            sse.js (stream istendiyse synthetic SSE)
-                                    │
-                                    ▼
-                                 İstemci
-```
-
-Yan akışta:
-- `probe.js` → her chat-supports model için native + XML tool testi → `data/tool_capability.json`
-- `scheduler.js` → `PROBE_INTERVAL_HOURS` (default 24) periyoduyla otomatik
-- `admin-router.js` → panel API'leri (key yönetimi, log akışı, manuel probe)
-
-## Geliştirme
+Model listesi:
 
 ```bash
-npm test            # node:test ile tüm unit testler
-npm run dev         # --watch mode
-npm run probe       # tek seferlik probe
+curl http://localhost:2393/v1/models \
+  -H "Authorization: Bearer $BRIDGE_KEY"
 ```
 
-## Konfigürasyon
+## Tool Calling
 
-`.env` (öncelikli) ve `config.json` (opsiyonel) iki kaynak var. Önemli alanlar:
+Bridge iki farkli yolu destekler:
 
-| Env | Default | Açıklama |
-|---|---|---|
-| `AIRFORCE_API_KEY` | – | Upstream key (zorunlu) |
-| `PORT` | 2393 | – |
-| `BRIDGE_API_KEYS` | (boş) | Virgüllü liste; boşsa sadece localhost'a izin |
-| `ADMIN_TOKEN` | (boş) | Panel girişi; boşsa BRIDGE_API_KEYS'in ilki |
-| `TOOL_ENGINE_FORCE_XML` | 1 | Native tool_calls'u baskıla, hep XML kullan |
-| `TOOL_ENGINE_FORMAT` | canonical | `canonical` veya `dsml` |
-| `PROBE_INTERVAL_HOURS` | 24 | Probe tekrar süresi |
-| `PROBE_ON_BOOT` | 1 | Boot'ta da probe çalıştır |
+1. Native passthrough: Upstream model zaten tool-call alanlari donduruyorsa bu bilgiler korunur.
+2. XML inject/parse: Native tool-call desteklemeyen modeller icin bridge system prompt'a XML semasi ekler, model cevabindaki XML'i parse eder ve sonucu OpenAI/Anthropic native tool-call formatina cevirir.
 
-Model alias'ları `config.json` içinde tanımlanır:
-
-```json
-{ "model_aliases": { "claude-sonnet-4-20250514": "glm-4.6" } }
-```
-
-## Tool-call XML formatı
-
-Default canonical format:
+Varsayilan canonical XML formati:
 
 ```xml
 <tool_calls>
@@ -126,12 +243,52 @@ Default canonical format:
 </tool_calls>
 ```
 
-Anti-leak: code-block (`` ``` ``) içindeki XML görmezden gelinir.
-JSON-tipli parametreler için değer JSON olarak yazılır:
+JSON tipli parametreler de parametre degeri olarak yazilabilir:
 
 ```xml
 <parameter name="filter">{"status":"open","limit":10}</parameter>
 ```
 
+Bridge, code block icindeki XML'i tool-call olarak yorumlamamaya calisir. Bu sayede modelin ornek olarak yazdigi XML ile gercek tool-call niyeti birbirinden ayrilir.
+
+## Admin Paneli
+
+Panel:
+
+```text
+http://localhost:2393/admin
+```
+
+Panel uzerinden:
+
+- Provider ve model durumlari gorulebilir
+- Alias ve model yonlendirmeleri takip edilebilir
+- Log ring buffer incelenebilir
+- Manuel probe tetiklenebilir
+- Admin API uzerinden konfigurasyon islemleri yapilabilir
+
+## Gelistirme
+
+```bash
+npm run dev
+npm test
+npm run probe
+```
+
+Komutlar:
+
+- `npm run dev`: Node watch mode ile calistirir
+- `npm test`: `node:test` tabanli testleri calistirir
+- `npm run probe`: Tool-call capability probe'unu tek seferlik calistirir
+
+## Operasyon Notlari
+
+- Bridge'i internete acacaksaniz mutlaka guclu `BRIDGE_API_KEYS` kullanin.
+- Admin panelini public acmayin veya ters proxy seviyesinde ek auth kullanin.
+- Provider API key'lerini repoya commit etmeyin.
+- `data/providers.json` icinde gercek key tutulacaksa dosya izinlerini sinirlayin.
+- Public deployment'ta loglarda prompt veya tool sonucu gibi hassas veri olabilecegini hesaba katin.
+
 ## Lisans
+
 MIT.
